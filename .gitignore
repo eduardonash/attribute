@@ -1,0 +1,6 @@
+# Track only the intended deliverables; keep local backups and credentials out.
+/*
+!/.gitignore
+!/README.md
+!/PROJECT.md
+!/AutoLeadAssist.client.lua
