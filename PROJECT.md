@@ -59,7 +59,8 @@ flowchart TD
    - Own-shell ESP uses a small elongated ForceField-material cosmetic Part that follows the observed projectile, whether the native projectile is a Part or Attachment. It is anchored, non-colliding, non-touching, non-queryable, and removed with the shot. It neither changes the native projectile nor adds a ForceField gameplay effect.
    - The bottom-left readout distinguishes `INPUT RECEIVED`, `SHOT SENT`, `SHELL LAUNCHED`, and `NOT FIRED`. Dispatch without a matched object reports `FLIGHT UNOBSERVED`. Progress follows observed position, not just a timer. A visual projectile ending near the predicted target reports `ARRIVAL OBSERVED`; early disappearance or stalled tracking is reported separately. Visual arrival does not prove a server hit or damage. ETA is an estimate and becomes unavailable when tracking stalls.
    - A fixed bottom-left HUD shows impact distance/elevation and flight time or cursor offset. It is not a cursor-following billboard.
-   - Enemy tanks use subtle Roblox `Highlight` outlines/fill, without labels. Enemy players use only a `Drawing` username above the character and a slim vertical health bar beside them—no card, box, distance, weapon, or numeric HP text.
+   - Enemy tanks use subtle Roblox `Highlight` outlines/fill, without labels. Enemy players use the isolated [Attribute fork of tulontop/esp-lib.lua](https://github.com/eduardonash/esp-lib.lua), authored by tul (@.lutyeh): togglable Drawing boxes, names and health bars. No distances, tracers or weapon labels are added. The runtime URL is pinned to fork commit `e44b14b4d642c8d24388d876204293e4f8a83389`; the library does not overwrite global ESP settings or create its own render connection in this integration.
+   - Player bounds enclose actual body parts, including R6 legs and R15 feet, instead of estimating height from HipHeight. Accessories and tools are excluded to avoid oversized boxes. Cached membership refreshes every 0.5 seconds; animated transforms are read each frame, combined into one conservative body-aligned box, then projected at eight corners. Offscreen corners still contribute to the bounds; near-plane intersections are hidden to avoid huge invalid boxes. One shared bound drives the box, name and health bar. Five Drawing objects are allocated per tracked player, with a 24-player cap and explicit removal on death/respawn/unload. Updates run after freecam/zoom to avoid camera-frame offset; tank Highlights remain independent.
 
 ---
 
@@ -179,6 +180,12 @@ The 2S19 gun tested here allows roughly $-3^\circ$ to $52^\circ$ of elevation. W
 The first revision still delayed or missed shell discovery, and the user reported dark text. The corrected revision removes gradients from text labels and replaces repeated projectile-state searches with passive Part/Attachment observation. The live client subsequently reported three dispatched shots and three observed shells; one nearby shell ended within about 0.8 studs of its predicted endpoint. This verifies detection in that client, not server damage. Long-flight filling, frozen-target appearance, and final readability still need user visual confirmation. No shots were fired by the assistant.
 
 ## 8. Cleanup and diagnostics
+
+### Player ESP library integration (2026-09-26)
+
+Forked `tulontop/esp-lib.lua` to `eduardonash/esp-lib.lua` and preserved author attribution and the upstream README's permission statement. Corrected full-body/offscreen bounds and added isolated/manual-update/remove/unload APIs. No new formal license was invented. Attribute loads an inspected immutable fork revision. If the library cannot load, player ESP reports unavailable while tank Highlights remain independent.
+
+Both sources compiled. Isolated tests passed for R6 head/feet coverage, rotated 15-part body coverage, partial viewport intersections, camera refresh, near-plane hiding, five Drawing objects for the selected features, and idempotent cleanup. These tests do not establish game FPS improvement or final live-player appearance.
 
 ### Moving-camera zoom correction (2026-09-26)
 

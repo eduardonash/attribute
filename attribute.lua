@@ -1813,46 +1813,42 @@ RunService:BindToRenderStep(VISUAL_RENDER_NAME, FREECAM_PRIORITY + 2, function()
     end
 end)
 
--- Tank ESP uses engine Highlights; player ESP uses one thin Drawing square,
--- a name, and two vertical health-bar lines.
+-- Player ESP: isolated, commit-pinned fork of tulontop/esp-lib.lua.
+-- Tank ESP continues to use Roblox Highlights independently.
 local playerDrawings = {}
 local tankHighlights = {}
 local espStats = { players = 0, tanks = 0 }
+local playerEsp
 local drawingAvailable = Drawing and type(Drawing.new) == "function"
+if drawingAvailable then
+    local ok, result = pcall(function()
+        local source = game:HttpGet("https://raw.githubusercontent.com/eduardonash/esp-lib.lua/e44b14b4d642c8d24388d876204293e4f8a83389/source.lua")
+        local chunk, err = loadstring(source)
+        assert(chunk, err)
+        return chunk({ isolated = true, manualUpdate = true, disableCorners = true, excludeAccessories = true })
+    end)
+    if ok then
+        playerEsp = result
+        playerEsp.box.padding = 1.03
+        playerEsp.box.type = "normal"
+        playerEsp.distance.enabled = false
+        playerEsp.tracer.enabled = false
+    else
+        drawingAvailable = false
+        espStats.error = tostring(result)
+        warn("[Attribute] Player ESP unavailable: " .. tostring(result))
+    end
+end
 
-local function createPlayerDrawing()
-    local boxOutline = Drawing.new("Square")
-    boxOutline.Filled = false
-    boxOutline.Thickness = 3
-    boxOutline.Color = THEME.Ink
-    boxOutline.ZIndex = 1
-    boxOutline.Visible = false
-    local box = Drawing.new("Square")
-    box.Filled = false
-    box.Thickness = 1
-    box.Visible = false
-    box.ZIndex = 2
-    local name = Drawing.new("Text")
-    name.Size = 12
-    name.Center = true
-    name.Outline = true
-    name.Visible = false
-    local healthBack = Drawing.new("Line")
-    healthBack.Color = Color3.fromRGB(28, 30, 34)
-    healthBack.Thickness = 4
-    healthBack.Visible = false
-    local healthFill = Drawing.new("Line")
-    healthFill.Thickness = 2
-    healthFill.Visible = false
-    return { box = box, boxOutline = boxOutline, name = name, healthBack = healthBack, healthFill = healthFill }
+local function createPlayerDrawing(character)
+    playerEsp.add_box(character)
+    playerEsp.add_healthbar(character)
+    playerEsp.add_name(character)
+    return { character = character }
 end
 
 local function removePlayerDrawing(tag)
-    tag.box:Remove()
-    tag.boxOutline:Remove()
-    tag.name:Remove()
-    tag.healthBack:Remove()
-    tag.healthFill:Remove()
+    if playerEsp then playerEsp.remove(tag.character) end
 end
 
 local function scanEnemyPlayers(origin)
@@ -1879,7 +1875,12 @@ local function scanEnemyPlayers(origin)
         for i = 1, math.min(#candidates, 24) do
             local c = candidates[i]
             local tag = playerDrawings[c.player]
-            if not tag then tag = createPlayerDrawing(); playerDrawings[c.player] = tag end
+            if tag and tag.character ~= c.player.Character then
+                removePlayerDrawing(tag)
+                playerDrawings[c.player] = nil
+                tag = nil
+            end
+            if not tag then tag = createPlayerDrawing(c.player.Character); playerDrawings[c.player] = tag end
             tag.head, tag.root, tag.humanoid = c.head, c.root, c.humanoid
             seen[c.player] = true
             espStats.players = espStats.players + 1
@@ -1894,52 +1895,21 @@ local function scanEnemyPlayers(origin)
 end
 
 local function updatePlayerDrawings(camera)
+    if not playerEsp then return end
     local accent = getESPColor()
+    playerEsp.box.enabled = Settings.PlayerESP and Settings.ESPBoxes
+    playerEsp.box.fill, playerEsp.box.outline = accent, THEME.Ink
+    playerEsp.name.enabled = Settings.PlayerESP and Settings.ESPNames
+    playerEsp.name.fill, playerEsp.name.size = accent, 12
+    playerEsp.healthbar.enabled = Settings.PlayerESP and Settings.ESPHealth
+    playerEsp.healthbar.fill, playerEsp.healthbar.outline = THEME.BlastOccupied, THEME.Ink
     for player, tag in pairs(playerDrawings) do
-        local humanoid = tag.humanoid
-        local head = tag.head
-        local root = tag.root
-        local valid = humanoid ~= nil and humanoid.Health > 0 and head ~= nil and root ~= nil
-            and head:IsDescendantOf(workspace) and root:IsDescendantOf(workspace)
-        local top, topVisible, foot, footVisible, left, right
-        if valid then
-            local up = Vector3.new(0, 1, 0)
-            local halfWidth = math.max(root.Size.X * 0.85, head.Size.X * 1.15, 1.25)
-            local screenRight = camera.CFrame.RightVector * halfWidth
-            top, topVisible = camera:WorldToViewportPoint(head.Position + up * (head.Size.Y * 0.5 + 0.1))
-            foot, footVisible = camera:WorldToViewportPoint(
-                root.Position - up * (humanoid.HipHeight + root.Size.Y * 0.5))
-            left = camera:WorldToViewportPoint(root.Position - screenRight)
-            right = camera:WorldToViewportPoint(root.Position + screenRight)
-        end
-        local visible = valid and topVisible and footVisible and top.Z > 0 and foot.Z > 0
-            and left.Z > 0 and right.Z > 0
-        tag.box.Visible = visible and Settings.ESPBoxes
-        tag.boxOutline.Visible = tag.box.Visible
-        tag.name.Visible = visible and Settings.ESPNames
-        tag.healthBack.Visible = visible and Settings.ESPHealth
-        tag.healthFill.Visible = visible and Settings.ESPHealth
-        if visible then
-            local topY, bottomY = math.min(top.Y, foot.Y), math.max(top.Y, foot.Y)
-            local height = math.max(bottomY - topY, 8)
-            local boxLeft = math.min(left.X, right.X)
-            local boxWidth = math.max(math.abs(right.X - left.X), 4)
-            local barX = boxLeft - 5
-            local fraction = math.clamp(humanoid.Health / math.max(humanoid.MaxHealth, 1), 0, 1)
-            tag.box.Color = accent
-            tag.box.Position = Vector2.new(boxLeft, topY)
-            tag.box.Size = Vector2.new(boxWidth, height)
-            tag.boxOutline.Position, tag.boxOutline.Size = tag.box.Position, tag.box.Size
-            tag.name.Text = player.Name
-            tag.name.Color = accent
-            tag.name.Position = Vector2.new(boxLeft + boxWidth * 0.5, topY - 17)
-            tag.healthBack.From = Vector2.new(barX, topY)
-            tag.healthBack.To = Vector2.new(barX, topY + height)
-            tag.healthFill.From = Vector2.new(barX, topY + height)
-            tag.healthFill.To = Vector2.new(barX, topY + height * (1 - fraction))
-            tag.healthFill.Color = THEME.BlastBlocked:Lerp(THEME.BlastOccupied, fraction)
+        if not tag.humanoid or tag.humanoid.Health <= 0 or player.Character ~= tag.character then
+            removePlayerDrawing(tag)
+            playerDrawings[player] = nil
         end
     end
+    playerEsp.update(camera)
 end
 
 local function scanEnemyTanks(origin)
@@ -2069,10 +2039,9 @@ local function scanEnemyArmor()
 end
 
 local lastPlayerScan = 0
-local lastPlayerDraw = 0
 local lastTankScan = 0
 local lastArmorScan = 0
-local espConn = RunService.RenderStepped:Connect(function()
+RunService:BindToRenderStep("AttributePlayerESP", FREECAM_PRIORITY + 4, function()
     local now = os.clock()
     local camera = workspace.CurrentCamera
     if not camera then return end
@@ -2081,10 +2050,7 @@ local espConn = RunService.RenderStepped:Connect(function()
         lastPlayerScan = now
         scanEnemyPlayers(origin)
     end
-    if now - lastPlayerDraw >= 1 / 30 then
-        lastPlayerDraw = now
-        updatePlayerDrawings(camera)
-    end
+    updatePlayerDrawings(camera)
     if now - lastTankScan >= 0.75 then
         lastTankScan = now
         scanEnemyTanks(origin)
@@ -2940,6 +2906,7 @@ _G.AutoLeadAssistDiagnostics = function()
         lastShot = lastShotDiagnostics,
         preview = visualDiagnostics,
         esp = { players = espStats.players, tanks = espStats.tanks,
+            backend = playerEsp and "esp-lib.lua" or "unavailable", error = espStats.error,
             playerEnabled = Settings.PlayerESP, tankEnabled = Settings.EnemyTankESP,
             boxesEnabled = Settings.ESPBoxes },
         armor = { enabled = Settings.ZeroEnemyArmor, vehicles = armorStats.vehicles,
@@ -3034,7 +3001,8 @@ _G.AutoLeadAssistUnload = function()
     for _, tag in pairs(playerDrawings) do removePlayerDrawing(tag) end
     RunService:UnbindFromRenderStep(VISUAL_RENDER_NAME)
     if aimCacheConn then aimCacheConn:Disconnect() end
-    if espConn then espConn:Disconnect() end
+    RunService:UnbindFromRenderStep("AttributePlayerESP")
+    if playerEsp then playerEsp.unload() end
     if freecamFireConn then freecamFireConn:Disconnect() end
     setZoom(false)
     for _, connection in pairs(armorVehicleWatchers) do connection:Disconnect() end
