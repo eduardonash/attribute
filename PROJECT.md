@@ -109,6 +109,8 @@ Impact and shot-readout labels use bright text with a dark stroke over a faint d
 
 ### Settings
 
+- `DisableFiringShake` defaults on and is remembered across reloads. The **Freecam → Camera → Disable Firing Shake** toggle zeros only the three client-side cannon muzzle-shake presets (`RecoilShake`, `RecoilShake2`, `RecoilShake3`). This also suppresses nearby cannon muzzle shake using those presets, but leaves explosion shake, physical recoil, firing, and camera controls unchanged. Original values are restored on disable/unload unless another owner changed them. No render loop or new firing hook is added. Diagnostics expose availability and errors; unsupported preset layouts fail without repeatedly retrying.
+
 - `EnableAutoLead`, `Trajectory`, `AutoLead`, `ShowBallistic`, and `AutoBallistic` control the aiming assist and bore/lead previews. `AutoBallistic` defaults off; the others default on except `ShowBallistic`.
 - `ExplosionRadius` toggles the compact filled impact-zone cue; `ShowDistance` controls both the zone distance label and bottom-left distance readout. `FlightTimer` controls flight-time information.
 - `OwnShellHighlight`, `ShotProgress`, and `ShotStatus` independently toggle own-projectile highlighting, the flight completion path, and shot confirmation. They default on and are remembered across reloads.
@@ -175,6 +177,10 @@ The 2S19 gun tested here allows roughly $-3^\circ$ to $52^\circ$ of elevation. W
 The first revision still delayed or missed shell discovery, and the user reported dark text. The corrected revision removes gradients from text labels and replaces repeated projectile-state searches with passive Part/Attachment observation. The live client subsequently reported three dispatched shots and three observed shells; one nearby shell ended within about 0.8 studs of its predicted endpoint. This verifies detection in that client, not server damage. Long-flight filling, frozen-target appearance, and final readability still need user visual confirmation. No shots were fired by the assistant.
 
 ## 8. Cleanup and diagnostics
+
+### Firing shake option (2026-09-26)
+
+Live source inspection confirmed that cannon muzzle effects call `vfxHandler.ShakeCam` with recoil presets, separately from explosion shake. The new toggle compiled successfully. Isolated preset-table tests passed for suppression, explosion preservation, restoration, repeated toggling, and respecting later changes by another owner. No live shot was fired and the full script was not reloaded during this update; final on-screen behavior remains unverified.
 
 ### Shot cleanup, text and zoom follow-up (2026-09-26)
 

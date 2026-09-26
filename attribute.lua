@@ -105,6 +105,7 @@ local Settings = {
     ESPMaxDistance = math.clamp(tonumber(rememberedSettings.ESPMaxDistance) or 4400, 0, 50000),
     AimSource = "Mouse",
     Freecam = false,
+    DisableFiringShake = rememberedSettings.DisableFiringShake ~= false,
     FreecamSpeed = math.clamp(tonumber(rememberedSettings.FreecamSpeed) or 3.5, 0.5, 20),
     FreecamKey = rememberedSettings.FreecamKey or Enum.KeyCode.V,
     Zoom = false,
@@ -112,6 +113,48 @@ local Settings = {
     ZoomKey = rememberedSettings.ZoomKey or Enum.KeyCode.Z
 }
 _G.AutoLeadAssistRemembered = Settings
+
+-- Suppress only the visual muzzle-recoil presets. Explosion effects, physical
+-- recoil, firing logic and camera navigation remain owned by the game.
+local firingShake = { originals = {}, keys = { "RecoilShake", "RecoilShake2", "RecoilShake3" } }
+function firingShake.restore()
+    if firingShake.presets then
+        for key, value in pairs(firingShake.originals) do
+            -- Do not overwrite a later change made by another owner.
+            if firingShake.presets[key] == 0 then firingShake.presets[key] = value end
+        end
+    end
+    firingShake.originals = {}
+    firingShake.active = false
+end
+function firingShake.set(enabled)
+    Settings.DisableFiringShake = enabled == true
+    firingShake.restore()
+    firingShake.error = nil
+    if not Settings.DisableFiringShake then return end
+    local ok, err = pcall(function()
+        local modules = ReplicatedStorage:FindFirstChild("TankModules")
+        local module = modules and modules:FindFirstChild("vfxHandler")
+        assert(module, "Firing shake module unavailable")
+        local presets = require(module).CamShakerPresets
+        assert(type(presets) == "table", "Firing shake presets unavailable")
+        firingShake.presets = presets
+        for _, key in ipairs(firingShake.keys) do
+            assert(type(presets[key]) == "number", "Unknown firing shake preset: " .. key)
+        end
+        for _, key in ipairs(firingShake.keys) do
+            firingShake.originals[key] = presets[key]
+            presets[key] = 0
+        end
+        firingShake.active = true
+    end)
+    if not ok then
+        firingShake.restore()
+        firingShake.error = tostring(err)
+        warn("[AutoLead] Firing shake suppression unavailable: " .. tostring(err))
+    end
+end
+firingShake.set(Settings.DisableFiringShake)
 
 local ESP_COLORS = {
     { name = "RED", color = Color3.fromRGB(255, 90, 125) },
@@ -448,6 +491,13 @@ do
 
             local freecamTab = window:Tab({ Name = "Freecam", Columns = 2 })
             local freecamControls = freecamTab:Section({ Name = "Camera", Side = 1 })
+            freecamControls:Toggle({
+                Name = "Disable Firing Shake",
+                Flag = "ALA_DisableFiringShake",
+                Default = Settings.DisableFiringShake,
+                Info = "Suppress cannon muzzle camera shake; keep explosion effects and physical recoil.",
+                Callback = function(value) firingShake.set(value) end
+            })
             freecamToggleHandle = freecamControls:Toggle({
                 Name = "Enable Freecam",
                 Flag = "ALA_Freecam",
@@ -2823,6 +2873,8 @@ _G.AutoLeadAssistDiagnostics = function()
         armor = { enabled = Settings.ZeroEnemyArmor, vehicles = armorStats.vehicles,
             values = armorStats.values, clientSideOnly = true },
         zoom = { enabled = Settings.Zoom, fov = Settings.ZoomFOV },
+        firingShake = { enabled = Settings.DisableFiringShake, active = firingShake.active == true,
+            error = firingShake.error },
         shotTracking = { message = shotTracker.message, detail = shotTracker.detail,
             active = #shotTracker.entries, dispatched = shotTracker.serial,
             observed = shotTracker.observed, rejected = shotTracker.rejected, scanMs = shotTracker.lastScanMs,
@@ -2928,6 +2980,7 @@ _G.AutoLeadAssistUnload = function()
         hookedWeaponHandler.fireWeapon = oldFireWeapon
     end
     setFreecam(false)
+    firingShake.restore()
     _G.AutoLeadAssistDiagnostics = nil
     _G.AutoLeadAssistSetFreecam = nil
     _G.AutoLeadAssistSetZoom = nil
