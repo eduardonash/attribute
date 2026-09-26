@@ -3,4 +3,4 @@
 !/.gitignore
 !/README.md
 !/PROJECT.md
-!/AutoLeadAssist.client.lua
+!/attribute.lua

@@ -10,7 +10,7 @@ It reads local vehicle, weapon, ammunition, and physics data to predict launch d
 
 ## 2. Core Architecture
 
-The codebase (`AutoLeadAssist.client.lua`) has these main data paths:
+The codebase (`attribute.lua`) has these main data paths:
 
 ```mermaid
 flowchart TD
