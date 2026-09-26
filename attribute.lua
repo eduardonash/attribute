@@ -106,6 +106,7 @@ local Settings = {
     AimSource = "Mouse",
     Freecam = false,
     DisableFiringShake = rememberedSettings.DisableFiringShake ~= false,
+    DisableExplosionShake = rememberedSettings.DisableExplosionShake ~= false,
     FreecamSpeed = math.clamp(tonumber(rememberedSettings.FreecamSpeed) or 3.5, 0.5, 20),
     FreecamKey = rememberedSettings.FreecamKey or Enum.KeyCode.V,
     Zoom = false,
@@ -155,6 +156,49 @@ function firingShake.set(enabled)
     end
 end
 firingShake.set(Settings.DisableFiringShake)
+
+function firingShake.restoreExplosions()
+    local control = firingShake.explosions
+    if not control then return end
+    control.enabled = false
+    if control.module.ShakeCam == control.shake then control.module.ShakeCam = control.originalShake end
+    if control.module.ShakeCamFromMass == control.mass then control.module.ShakeCamFromMass = control.originalMass end
+    firingShake.explosions = nil
+end
+function firingShake.setExplosions(enabled)
+    Settings.DisableExplosionShake = enabled == true
+    firingShake.restoreExplosions()
+    firingShake.explosionError = nil
+    if not Settings.DisableExplosionShake then return end
+    local ok, err = pcall(function()
+        local modules = ReplicatedStorage:FindFirstChild("TankModules")
+        local module = modules and modules:FindFirstChild("vfxHandler")
+        assert(module, "Explosion shake module unavailable")
+        local vfx = require(module)
+        assert(type(vfx.ShakeCam) == "function" and type(vfx.ShakeCamFromMass) == "function",
+            "Explosion shake functions unavailable")
+        local control = { module = vfx, enabled = true,
+            originalShake = vfx.ShakeCam, originalMass = vfx.ShakeCamFromMass }
+        control.shake = function(preset, ...)
+            if control.enabled and (preset == nil or preset == "Explosion" or preset == "SmallExplosion") then return end
+            return control.originalShake(preset, ...)
+        end
+        -- Shell impacts and flybys share this visual-only helper. Suppress
+        -- scheduling new shake impulses, not explosion particles or damage.
+        control.mass = function(...)
+            if control.enabled then return end
+            return control.originalMass(...)
+        end
+        firingShake.explosions = control
+        vfx.ShakeCam, vfx.ShakeCamFromMass = control.shake, control.mass
+    end)
+    if not ok then
+        firingShake.restoreExplosions()
+        firingShake.explosionError = tostring(err)
+        warn("[AutoLead] Explosion shake suppression unavailable: " .. tostring(err))
+    end
+end
+firingShake.setExplosions(Settings.DisableExplosionShake)
 
 local ESP_COLORS = {
     { name = "RED", color = Color3.fromRGB(255, 90, 125) },
@@ -505,6 +549,13 @@ do
 
             local freecamTab = window:Tab({ Name = "Freecam", Columns = 2 })
             local freecamControls = freecamTab:Section({ Name = "Camera", Side = 1 })
+            freecamControls:Toggle({
+                Name = "Disable Explosion Shake",
+                Flag = "ALA_DisableExplosionShake",
+                Default = Settings.DisableExplosionShake,
+                Info = "Suppress explosion and shared shell-flyby camera shake; keep damage, sound and particles.",
+                Callback = function(value) firingShake.setExplosions(value) end
+            })
             freecamControls:Toggle({
                 Name = "Disable Firing Shake",
                 Flag = "ALA_DisableFiringShake",
@@ -2889,6 +2940,8 @@ _G.AutoLeadAssistDiagnostics = function()
         zoom = { enabled = Settings.Zoom, fov = Settings.ZoomFOV },
         firingShake = { enabled = Settings.DisableFiringShake, active = firingShake.active == true,
             error = firingShake.error },
+        explosionShake = { enabled = Settings.DisableExplosionShake,
+            active = firingShake.explosions ~= nil, error = firingShake.explosionError },
         shotTracking = { message = shotTracker.message, detail = shotTracker.detail,
             active = #shotTracker.entries, dispatched = shotTracker.serial,
             observed = shotTracker.observed, rejected = shotTracker.rejected, scanMs = shotTracker.lastScanMs,
@@ -2995,6 +3048,7 @@ _G.AutoLeadAssistUnload = function()
     end
     setFreecam(false)
     firingShake.restore()
+    firingShake.restoreExplosions()
     _G.AutoLeadAssistDiagnostics = nil
     _G.AutoLeadAssistSetFreecam = nil
     _G.AutoLeadAssistSetZoom = nil

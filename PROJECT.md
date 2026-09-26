@@ -109,6 +109,8 @@ Impact and shot-readout labels use bright text with a dark stroke over a faint d
 
 ### Settings
 
+- `DisableExplosionShake` defaults on and is remembered. **Freecam → Camera → Disable Explosion Shake** suppresses named/default explosion camera shake and the mass-based camera-shake helper shared by shell impacts and flybys. It does not suppress damage, sounds, particles, physical recoil or alter the camera directly. The muzzle-recoil toggle remains separate. Original effect functions are restored on disable/unload, without overwriting later replacements by other code. Effects already scheduled before enabling may finish their existing decay.
+
 - `DisableFiringShake` defaults on and is remembered across reloads. The **Freecam → Camera → Disable Firing Shake** toggle zeros only the three client-side cannon muzzle-shake presets (`RecoilShake`, `RecoilShake2`, `RecoilShake3`). This also suppresses nearby cannon muzzle shake using those presets, but leaves explosion shake, physical recoil, firing, and camera controls unchanged. Original values are restored on disable/unload unless another owner changed them. No render loop or new firing hook is added. Diagnostics expose availability and errors; unsupported preset layouts fail without repeatedly retrying.
 
 - `EnableAutoLead`, `Trajectory`, `AutoLead`, `ShowBallistic`, and `AutoBallistic` control the aiming assist and bore/lead previews. `AutoBallistic` defaults off; the others default on except `ShowBallistic`.
@@ -177,6 +179,10 @@ The 2S19 gun tested here allows roughly $-3^\circ$ to $52^\circ$ of elevation. W
 The first revision still delayed or missed shell discovery, and the user reported dark text. The corrected revision removes gradients from text labels and replaces repeated projectile-state searches with passive Part/Attachment observation. The live client subsequently reported three dispatched shots and three observed shells; one nearby shell ended within about 0.8 studs of its predicted endpoint. This verifies detection in that client, not server damage. Long-flight filling, frozen-target appearance, and final readability still need user visual confirmation. No shots were fired by the assistant.
 
 ## 8. Cleanup and diagnostics
+
+### Explosion shake follow-up (2026-09-26)
+
+After the user clarified that shell detonation triggers the movement, added a separate explosion/flyby camera-shake toggle rather than relying on muzzle presets or zoom correction. Full-source compilation passed. Isolated tests passed for explosion/mass suppression, recoil pass-through, restoration, repeated toggling, preserving another owner's replacement and disabling retained wrappers on unload. This revision was not live-fired or reloaded during implementation.
 
 ### Zoom/recoil interaction follow-up (2026-09-26)
 
