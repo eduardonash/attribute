@@ -180,6 +180,12 @@ The first revision still delayed or missed shell discovery, and the user reporte
 
 ## 8. Cleanup and diagnostics
 
+### Moving-camera zoom correction (2026-09-26)
+
+The earlier angular-proximity restore heuristic proved unreliable in user testing, including on foot. It has been replaced: the late zoom transform is presentation-only, and its exact saved camera pose/FOV is restored before the next input/camera update. The normal camera controller then computes movement before one new cursor lens transform is applied. There is no angle-based ownership guess or residual integration. Shortest-arc ray rotation replaces the paired lookAt frames to avoid extra roll. Mouse pixels are bounded to the viewport, native FOV changes are captured, and camera swaps/disable/freecam entry restore the owned pose.
+
+Full-source compilation passed. An isolated harness running the actual zoom callbacks passed 1,800 frames across three FOV modes, with position/orientation/FOV changes, cursor sweeps and perturbations. Maximum cursor-direction error was about `2.5e-7`, with zero restore or position error; callback cleanup passed. This supersedes the earlier residual-preserving zoom approach. The test does not establish compatibility with every third-party camera writer; user testing is still needed for moving tanks and on-foot controls.
+
 ### Explosion shake follow-up (2026-09-26)
 
 After the user clarified that shell detonation triggers the movement, added a separate explosion/flyby camera-shake toggle rather than relying on muzzle presets or zoom correction. Full-source compilation passed. Isolated tests passed for explosion/mass suppression, recoil pass-through, restoration, repeated toggling, preserving another owner's replacement and disabling retained wrappers on unload. This revision was not live-fired or reloaded during implementation.

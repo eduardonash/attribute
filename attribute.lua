@@ -235,21 +235,25 @@ local originalZoomFOV = nil
 local zoomState = { base = nil, applied = nil }
 
 function zoomState.restore(cam)
-    if not cam or not zoomState.base or not zoomState.applied then return end
-    local current = cam.CFrame
-    local residual = zoomState.applied:ToObjectSpace(current)
-    local _, appliedAngle = residual:ToAxisAngle()
-    local _, baseAngle = zoomState.base:ToObjectSpace(current):ToAxisAngle()
-    -- A small camera/recoil delta must not strand last frame's lens rotation.
-    -- Preserve world translation and the residual rotation. If a controller
-    -- already replaced the view with an unzoomed pose, leave that pose alone.
-    if math.abs(appliedAngle) <= math.abs(baseAngle) + 1e-5 then
-        cam.CFrame = (CFrame.new(current.Position) * zoomState.base.Rotation * residual.Rotation):Orthonormalize()
-    end
-    zoomState.base, zoomState.applied = nil, nil
+    if not cam or cam ~= zoomState.owner or not zoomState.base then return end
+    -- The late lens is presentation-only. Restore its saved input before the
+    -- next input/camera update, never infer ownership from changing angles.
+    cam.CFrame = zoomState.base
+    if zoomState.sourceFOV then cam.FieldOfView = zoomState.sourceFOV end
+    zoomState.base, zoomState.applied, zoomState.owner, zoomState.sourceFOV = nil, nil, nil, nil
+end
+
+function zoomState.lensRotation(wideRay, narrowRay)
+    -- Shortest rotation maps the narrow cursor ray onto the wide cursor ray
+    -- without the extra roll of multiplying two world-up lookAt frames.
+    local axis = narrowRay:Cross(wideRay)
+    local sine = axis.Magnitude
+    if sine < 1e-7 then return CFrame.identity end
+    return CFrame.fromAxisAngle(axis / sine, math.atan2(sine, math.clamp(narrowRay:Dot(wideRay), -1, 1)))
 end
 
 local function setZoom(enabled)
+    zoomState.restore(zoomCamera)
     Settings.Zoom = enabled == true
     pcall(function() RunService:UnbindFromRenderStep(ZOOM_RENDER_NAME) end)
     pcall(function() RunService:UnbindFromRenderStep(ZOOM_RENDER_NAME .. "Restore") end)
@@ -269,7 +273,6 @@ local function setZoom(enabled)
     RunService:BindToRenderStep(ZOOM_RENDER_NAME .. "Restore", Enum.RenderPriority.First.Value - 1, function()
         if zoomCamera and zoomCamera == workspace.CurrentCamera then
             zoomState.restore(zoomCamera)
-            if originalZoomFOV then zoomCamera.FieldOfView = originalZoomFOV end
         end
     end)
     RunService:BindToRenderStep(ZOOM_RENDER_NAME, FREECAM_PRIORITY + 1, function()
@@ -286,7 +289,12 @@ local function setZoom(enabled)
             originalZoomFOV = cam.FieldOfView
         end
         local base = freecamActive and freecamCFrame or cam.CFrame
+        -- Camera controllers can legitimately change FOV while moving/seating.
+        originalZoomFOV = cam.FieldOfView
         local mouse = UserInputService:GetMouseLocation()
+        local viewport = cam.ViewportSize
+        if viewport.X < 1 or viewport.Y < 1 then return end
+        mouse = Vector2.new(math.clamp(mouse.X, 0, viewport.X), math.clamp(mouse.Y, 0, viewport.Y))
         -- Use engine projection for aspect ratio/FOV mode, with viewport pixels.
         cam.CFrame = base
         cam.FieldOfView = originalZoomFOV
@@ -295,10 +303,9 @@ local function setZoom(enabled)
         local narrowRay = base:VectorToObjectSpace(cam:ViewportPointToRay(mouse.X, mouse.Y).Direction)
         -- Zoom around the cursor: the point under it stays under it while the
         -- magnified view follows its position across the original viewport.
-        local wideFrame = CFrame.lookAt(Vector3.zero, wideRay)
-        local narrowFrame = CFrame.lookAt(Vector3.zero, narrowRay)
         zoomState.base = base
-        zoomState.applied = (base * wideFrame * narrowFrame:Inverse()):Orthonormalize()
+        zoomState.owner, zoomState.sourceFOV = cam, originalZoomFOV
+        zoomState.applied = (base * zoomState.lensRotation(wideRay, narrowRay)):Orthonormalize()
         cam.CFrame = zoomState.applied
         cam.FieldOfView = Settings.ZoomFOV
     end)
