@@ -95,6 +95,7 @@ local Settings = {
     Trajectory = true,
     AutoLead = true,
     AutoBallistic = rememberedSettings.AutoBallistic == true,
+    InfiniteAmmo = rememberedSettings.InfiniteAmmo == true,
     EnemyTankESP = rememberedSettings.EnemyTankESP ~= false,
     ZeroEnemyArmor = rememberedSettings.ZeroEnemyArmor ~= false,
     PlayerESP = rememberedSettings.PlayerESP ~= false,
@@ -524,6 +525,8 @@ do
 
             local aimTab = window:Tab({ Name = "Aim", Columns = 2 })
             local aimAssist = aimTab:Section({ Name = "Assist", Side = 1 })
+            settingToggle(aimAssist, "Infinite Ammo / No Reload", "InfiniteAmmo",
+                "Opt-in local reload suppression. Server ammo rules still apply; off by default.")
             settingToggle(aimAssist, "Enable Assist", "EnableAutoLead", "Master aiming and preview switch.")
             settingToggle(aimAssist, "Auto Lead", "AutoLead", "Steer shots toward the selected point.")
             settingToggle(aimAssist, "Auto Ballistic", "AutoBallistic", "Prefer a clear high arc within the gun's elevation limits.")
@@ -2807,9 +2810,11 @@ local function installHooks()
                 if p59 and (type(p57) == "string" or type(p57) == "number") then
                     pcall(function() shotCodeByVehicle[p59] = p57 end)
                 end
-                -- Suppress the local unload/reload transition for both native
-                -- clicks and direct F shots. Server-side ammo remains authoritative.
-                local results = table.pack(oldFireWeapon(p56, p57, u58, p59, false, p61, p62, p63))
+                -- Off preserves the native caller's reload flag, including nil.
+                -- Do not use 'enabled and false or p60': false would fall through.
+                local reloadAfterShot = p60
+                if Settings.InfiniteAmmo then reloadAfterShot = false end
+                local results = table.pack(oldFireWeapon(p56, p57, u58, p59, reloadAfterShot, p61, p62, p63))
                 if shotTracker.serial == before then
                     shotTracker.reject(shotTracker.gameErrorAt and os.clock() - shotTracker.gameErrorAt < 0.2
                         and shotTracker.gameError or aimCache.fireBlock or "Game did not launch a projectile")
@@ -2864,8 +2869,9 @@ triggerDirectFire = function()
     local ok, fired = pcall(function()
         -- MTC inserts -p62 into bulletData.directions, so pass the negative
         -- desired launch direction. The FireBullet hook then refines it again.
-        -- p60=false preserves the existing no-reload behavior.
-        return hookedWeaponHandler.fireWeapon(wm, shotCode, wData.weapon, veh, false, nil, -aimDirection, mainSight)
+        -- Direct shots request normal unloading; the wrapper suppresses it only
+        -- when Infinite Ammo / No Reload is explicitly enabled.
+        return hookedWeaponHandler.fireWeapon(wm, shotCode, wData.weapon, veh, true, nil, -aimDirection, mainSight)
     end)
     if not ok then
         lastDirectFireError = tostring(fired)
@@ -2900,6 +2906,7 @@ _G.AutoLeadAssistDiagnostics = function()
         freecam = freecamActive,
         autoLead = Settings.AutoLead,
         autoBallistic = Settings.AutoBallistic,
+        infiniteAmmo = Settings.InfiniteAmmo,
         weaponHook = hookedWeaponHandler ~= nil,
         directFireReady = veh and shotCodeByVehicle[veh] ~= nil or false,
         directFireError = lastDirectFireError,
