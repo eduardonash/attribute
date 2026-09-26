@@ -190,6 +190,21 @@ local zoomCamera = nil
 local originalZoomFOV = nil
 local zoomState = { base = nil, applied = nil }
 
+function zoomState.restore(cam)
+    if not cam or not zoomState.base or not zoomState.applied then return end
+    local current = cam.CFrame
+    local residual = zoomState.applied:ToObjectSpace(current)
+    local _, appliedAngle = residual:ToAxisAngle()
+    local _, baseAngle = zoomState.base:ToObjectSpace(current):ToAxisAngle()
+    -- A small camera/recoil delta must not strand last frame's lens rotation.
+    -- Preserve world translation and the residual rotation. If a controller
+    -- already replaced the view with an unzoomed pose, leave that pose alone.
+    if math.abs(appliedAngle) <= math.abs(baseAngle) + 1e-5 then
+        cam.CFrame = (CFrame.new(current.Position) * zoomState.base.Rotation * residual.Rotation):Orthonormalize()
+    end
+    zoomState.base, zoomState.applied = nil, nil
+end
+
 local function setZoom(enabled)
     Settings.Zoom = enabled == true
     pcall(function() RunService:UnbindFromRenderStep(ZOOM_RENDER_NAME) end)
@@ -198,9 +213,7 @@ local function setZoom(enabled)
         if zoomCamera and originalZoomFOV then
             pcall(function()
                 zoomCamera.FieldOfView = originalZoomFOV
-                if zoomState.applied and zoomCamera.CFrame == zoomState.applied then
-                    zoomCamera.CFrame = zoomState.base
-                end
+                zoomState.restore(zoomCamera)
             end)
         end
         zoomCamera, originalZoomFOV = nil, nil
@@ -209,11 +222,9 @@ local function setZoom(enabled)
     end
     -- Remove our previous lens transform before the game's camera runs. This
     -- prevents cursor-follow rotation accumulating on itself outside freecam.
-    RunService:BindToRenderStep(ZOOM_RENDER_NAME .. "Restore", Enum.RenderPriority.Camera.Value - 1, function()
+    RunService:BindToRenderStep(ZOOM_RENDER_NAME .. "Restore", Enum.RenderPriority.First.Value - 1, function()
         if zoomCamera and zoomCamera == workspace.CurrentCamera then
-            if zoomState.applied and zoomCamera.CFrame == zoomState.applied then
-                zoomCamera.CFrame = zoomState.base
-            end
+            zoomState.restore(zoomCamera)
             if originalZoomFOV then zoomCamera.FieldOfView = originalZoomFOV end
         end
     end)
@@ -222,7 +233,10 @@ local function setZoom(enabled)
         if not cam then return end
         if cam ~= zoomCamera then
             if zoomCamera and originalZoomFOV then
-                pcall(function() zoomCamera.FieldOfView = originalZoomFOV end)
+                pcall(function()
+                    zoomState.restore(zoomCamera)
+                    zoomCamera.FieldOfView = originalZoomFOV
+                end)
             end
             zoomCamera = cam
             originalZoomFOV = cam.FieldOfView
@@ -240,7 +254,7 @@ local function setZoom(enabled)
         local wideFrame = CFrame.lookAt(Vector3.zero, wideRay)
         local narrowFrame = CFrame.lookAt(Vector3.zero, narrowRay)
         zoomState.base = base
-        zoomState.applied = base * wideFrame * narrowFrame:Inverse()
+        zoomState.applied = (base * wideFrame * narrowFrame:Inverse()):Orthonormalize()
         cam.CFrame = zoomState.applied
         cam.FieldOfView = Settings.ZoomFOV
     end)
@@ -289,8 +303,8 @@ local function setFreecam(enabled)
         originalCamType = cam.CameraType
         originalSubject = cam.CameraSubject
 
-        freecamCFrame = Settings.Zoom and zoomState.base and zoomState.applied == cam.CFrame
-            and zoomState.base or cam.CFrame
+        if Settings.Zoom then zoomState.restore(cam) end
+        freecamCFrame = cam.CFrame
         local rx, ry, _ = freecamCFrame:ToOrientation()
         freecamRotY = rx
         freecamRotX = ry

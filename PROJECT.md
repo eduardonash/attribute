@@ -178,6 +178,12 @@ The first revision still delayed or missed shell discovery, and the user reporte
 
 ## 8. Cleanup and diagnostics
 
+### Zoom/recoil interaction follow-up (2026-09-26)
+
+The preset toggle was active in the inspected client, but shell flyby and explosion effects use a separate mass-based shake path. Zoom previously removed its lens rotation only when the camera CFrame exactly equaled its last output; even small external camera changes could leave the lens rotation applied for another frame. Restoration now runs before the normal render priorities, preserves small residual rotations and world translation, and avoids undoing a pose already replaced with an unzoomed view. This ownership check compares angular proximity and is not a universal guarantee for arbitrary third-party camera controllers. Restored/applied rotations are orthonormalized to prevent matrix drift. The same cleanup handles zoom disable, camera replacement and freecam entry.
+
+Isolated testing of the actual restore helper over 600 simulated recoil frames produced a maximum direction error around `1.2e-5` against the expected recoil-only view. A replacement-camera-pose test passed. This is not a live firing verification; flyby/explosion shake remains intentionally separate from the muzzle-preset toggle.
+
 ### Firing shake option (2026-09-26)
 
 Live source inspection confirmed that cannon muzzle effects call `vfxHandler.ShakeCam` with recoil presets, separately from explosion shake. The new toggle compiled successfully. Isolated preset-table tests passed for suppression, explosion preservation, restoration, repeated toggling, and respecting later changes by another owner. No live shot was fired and the full script was not reloaded during this update; final on-screen behavior remains unverified.
