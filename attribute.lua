@@ -2082,6 +2082,12 @@ local lastShotDiagnostics = nil
 local shotTracker = { queue = {}, entries = {}, serial = 0, alive = true,
     message = "NO SHOT YET", detail = "Waiting for a confirmed projectile", sent = 0,
     attempts = 0, observed = 0, rejected = 0, candidates = {}, projectileNames = {} }
+shotTracker.flightGui = Instance.new("ScreenGui")
+shotTracker.flightGui.Name = "AttributeFlights"
+shotTracker.flightGui.IgnoreGuiInset = true
+shotTracker.flightGui.ResetOnSpawn = false
+shotTracker.flightGui.DisplayOrder = screenGui.DisplayOrder - 1
+shotTracker.flightGui.Parent = screenGui.Parent
 
 function shotTracker.releaseCandidate(record)
     if record.motion then record.motion:Disconnect() end
@@ -2106,7 +2112,7 @@ function shotTracker.observePart(part)
     local record = { part = part, born = os.clock() }
     shotTracker.candidates[part] = record
     local function sample()
-        local position = part.Position
+        local position = part:IsA("Attachment") and part.WorldPosition or part.Position
         if math.abs(position.X) > 100000 or math.abs(position.Z) > 100000 then
             if record.first then
                 record.ended = true
@@ -2117,7 +2123,10 @@ function shotTracker.observePart(part)
             return
         end
         local now = os.clock()
-        if not record.first then record.first = position; record.direction = part.CFrame.LookVector end
+        if not record.first then
+            record.first = position
+            record.direction = (part:IsA("Attachment") and part.WorldCFrame or part.CFrame).LookVector
+        end
         if record.position and now - (record.sampleTime or now) > 0.002 then
             record.velocity = (position - record.position) / (now - record.sampleTime)
         end
@@ -2185,20 +2194,6 @@ function shotTracker.remove(entry)
     for _, item in ipairs(entry.visuals or {}) do item:Destroy() end
 end
 
-function shotTracker.makeBeam(entry, name, color, transparency)
-    local beam = makeTrajectoryBeam(name, color)
-    beam.beam.Transparency = NumberSequence.new(transparency)
-    beam.beam.Width0, beam.beam.Width1 = 0.22, 0.3
-    entry.visuals[#entry.visuals + 1] = beam.beam
-    entry.visuals[#entry.visuals + 1] = beam.outline
-    entry.visuals[#entry.visuals + 1] = beam.origin
-    entry.visuals[#entry.visuals + 1] = beam.impact
-    -- Flight attachments have their own bounded lifetime, unlike previews.
-    table.remove(beamAttachments)
-    table.remove(beamAttachments)
-    return beam
-end
-
 function shotTracker.attach(entry, state)
     entry.state = state
     entry.visuals = {}
@@ -2216,21 +2211,20 @@ function shotTracker.attach(entry, state)
     local finish, hit, time, _, endVelocity = traceTrajectory(entry.start, entry.initialVelocity,
         w.gravity, w.drag, getTrajectoryParams(entry.vehicle), steps, duration / steps)
     entry.expectedTime, entry.expectedEnd, entry.expectedHit = time, finish, hit ~= nil
-    entry.remaining = shotTracker.makeBeam(entry, "OwnShellPath", THEME.PathPending, 0.08)
-    showTrajectoryBeam(entry.remaining, entry.start, finish, entry.initialVelocity, endVelocity, time)
-    -- One frozen cubic path; only its completed color span advances. Rebuilding
-    -- a separate curve to the moving shell made the two paths fail to overlap.
+    -- A full forecast is retained, but completed geometry comes from observed
+    -- movement. Pixel-width segments avoid subpixel world-Beam stippling.
     local p0, p3 = entry.start, finish
-    local p1 = p0 + entry.remaining.origin.WorldCFrame.RightVector * entry.remaining.beam.CurveSize0
-    local p2 = p3 - entry.remaining.impact.WorldCFrame.RightVector * entry.remaining.beam.CurveSize1
+    local p1 = p0 + entry.initialVelocity * (time / 3)
+    local p2 = p3 - endVelocity * (time / 3)
     entry.samples, entry.pathLength = { { point = p0, length = 0 } }, 0
-    for i = 1, 24 do
-        local t = i / 24
+    for i = 1, 48 do
+        local t = i / 48
         local u = 1 - t
         local point = p0 * u^3 + p1 * (3*u*u*t) + p2 * (3*u*t*t) + p3 * t^3
         entry.pathLength = entry.pathLength + (point - entry.samples[#entry.samples].point).Magnitude
         entry.samples[#entry.samples + 1] = { point = point, length = entry.pathLength }
     end
+    shotTracker.makeFlightOverlay(entry)
     entry.zone = blastZone:Clone()
     entry.zone.Name = "ConfirmedShotTarget"
     entry.zone.Size = Vector3.new(0.12, 8, 8)
@@ -2331,25 +2325,117 @@ do
     end
 end
 
-function shotTracker.fillPath(entry, fraction)
-    fraction = math.clamp(fraction, 0, 1)
-    if entry.drawnFraction and math.abs(entry.drawnFraction - fraction) < 0.003 then return end
-    entry.drawnFraction = fraction
-    local color
-    if fraction >= 1 then
-        color = ColorSequence.new(THEME.FlightStart, THEME.FlightEnd)
-    elseif fraction < 0.001 then
-        color = ColorSequence.new(THEME.PathPending)
-    else
-        local edge = math.min(fraction, 0.998)
-        color = ColorSequence.new({
-            ColorSequenceKeypoint.new(0, THEME.FlightStart),
-            ColorSequenceKeypoint.new(edge, THEME.FlightEnd),
-            ColorSequenceKeypoint.new(edge + 0.001, THEME.PathPending),
-            ColorSequenceKeypoint.new(1, THEME.PathPending)
-        })
+function shotTracker.makeFlightOverlay(entry)
+    local layer = Instance.new("Frame")
+    layer.Name = "ConfirmedFlight"
+    layer.Size = UDim2.fromScale(1, 1)
+    layer.BackgroundTransparency = 1
+    layer.ClipsDescendants = true
+    layer.Parent = shotTracker.flightGui
+    entry.visuals[#entry.visuals + 1] = layer
+    entry.layer, entry.lines, entry.traveled = layer, {}, { entry.start }
+    entry.routePosition, entry.routeProgress = entry.start, 0
+    for i = 1, #entry.samples do -- one extra segment for the moving split
+        local border = Instance.new("Frame")
+        border.AnchorPoint = Vector2.new(0.5, 0.5)
+        border.BorderSizePixel = 0
+        border.BackgroundColor3 = THEME.Ink
+        border.BackgroundTransparency = 0.12
+        border.Visible = false
+        border.Parent = layer
+        local line = Instance.new("Frame")
+        line.AnchorPoint = Vector2.new(0.5, 0.5)
+        line.Position = UDim2.fromScale(0.5, 0.5)
+        line.Size = UDim2.new(1, 0, 0, 2)
+        line.BorderSizePixel = 0
+        line.Parent = border
+        entry.lines[i] = { border = border, line = line }
     end
-    entry.remaining.beam.Color = color
+    local marker = Instance.new("Frame")
+    marker.Name = "ObservedShell"
+    marker.AnchorPoint = Vector2.new(0.5, 0.5)
+    marker.Size = UDim2.fromOffset(9, 9)
+    marker.BackgroundColor3 = THEME.FlightStart
+    marker.BackgroundTransparency = 0.2
+    marker.BorderSizePixel = 0
+    marker.ZIndex = 3
+    marker.Parent = layer
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(1, 0)
+    corner.Parent = marker
+    local stroke = Instance.new("UIStroke")
+    stroke.Color, stroke.Thickness = THEME.Ink, 2
+    stroke.Parent = marker
+    entry.shellMarker = marker
+end
+
+-- Clip before sizing GUI lines, including crossings of the camera near plane.
+function shotTracker.screenSegment(cam, a, b)
+    local da = -cam.CFrame:PointToObjectSpace(a).Z
+    local db = -cam.CFrame:PointToObjectSpace(b).Z
+    if da < 0.1 and db < 0.1 then return end
+    if da < 0.1 then a = a:Lerp(b, (0.1 - da) / (db - da))
+    elseif db < 0.1 then b = a:Lerp(b, (0.1 - da) / (db - da)) end
+    local pa, pb = cam:WorldToViewportPoint(a), cam:WorldToViewportPoint(b)
+    local start = Vector2.new(pa.X, pa.Y)
+    local delta = Vector2.new(pb.X - pa.X, pb.Y - pa.Y)
+    local lo, hi = 0, 1
+    local function clip(p, q)
+        if math.abs(p) < 1e-8 then return q >= 0 end
+        local t = q / p
+        if p < 0 then lo = math.max(lo, t) else hi = math.min(hi, t) end
+        return lo <= hi
+    end
+    local view = cam.ViewportSize
+    if not clip(-delta.X, start.X) or not clip(delta.X, view.X - start.X)
+        or not clip(-delta.Y, start.Y) or not clip(delta.Y, view.Y - start.Y) then return end
+    return start + delta * lo, start + delta * hi
+end
+
+function shotTracker.drawFlight(entry, cam)
+    local n = #entry.samples - 1
+    local progress = math.clamp(entry.progress or 0, 0, 0.9999)
+    local position = entry.state.position
+    -- Commit passed waypoints from measured motion, not the forecast curve.
+    for i = math.floor(entry.routeProgress * n) + 1, math.floor(progress * n) do
+        local alpha = math.clamp((i / n - entry.routeProgress)
+            / math.max(progress - entry.routeProgress, 1e-8), 0, 1)
+        entry.traveled[i + 1] = entry.routePosition:Lerp(position, alpha)
+    end
+    entry.routeProgress, entry.routePosition = progress, position
+    local split = math.floor(progress * n) + 1
+    local forecast = entry.samples[split].point:Lerp(entry.samples[split + 1].point, progress * n % 1)
+    local correction = position - forecast
+    local used = 0
+    local function draw(a, b, complete, fraction)
+        used = used + 1
+        local item = entry.lines[used]
+        local pa, pb = shotTracker.screenSegment(cam, a, b)
+        item.border.Visible = Settings.ShotProgress and pa ~= nil
+        if not item.border.Visible then return end
+        local delta = pb - pa
+        item.border.Position = UDim2.fromOffset((pa.X + pb.X) / 2, (pa.Y + pb.Y) / 2)
+        item.border.Size = UDim2.fromOffset(math.max(delta.Magnitude, 0.1), complete and 4 or 3)
+        item.border.Rotation = math.deg(math.atan2(delta.Y, delta.X))
+        item.line.BackgroundColor3 = complete and THEME.FlightStart:Lerp(THEME.FlightEnd, fraction)
+            or Color3.fromRGB(207, 218, 232)
+        item.line.BackgroundTransparency = complete and 0 or 0.5
+    end
+    for i = 1, split - 1 do
+        draw(entry.traveled[i], entry.traveled[i + 1], true, i / n)
+    end
+    draw(entry.traveled[split], position, true, progress)
+    local previous = position
+    for i = split + 1, #entry.samples do
+        -- Join the forecast to the observed shell without moving its target.
+        local weight = math.clamp((1 - (i - 1) / n) / math.max(1 - progress, 1e-8), 0, 1)
+        local point = entry.samples[i].point + correction * weight
+        draw(previous, point, false, (i - 1) / n)
+        previous = point
+    end
+    local point, visible = cam:WorldToViewportPoint(position)
+    entry.shellMarker.Visible = Settings.OwnShellHighlight and visible and point.Z > 0
+    entry.shellMarker.Position = UDim2.fromOffset(point.X, point.Y)
 end
 
 function shotTracker.projectProgress(entry, position)
@@ -2446,7 +2532,7 @@ RunService:BindToRenderStep("AutoLeadShotTracking", FREECAM_PRIORITY + 3, functi
         end
         if state and not entry.finished then
             local show = Settings.ShotProgress
-            entry.remaining.beam.Enabled = show
+            shotTracker.drawFlight(entry, workspace.CurrentCamera)
             entry.zone.Transparency = show and 0.48 or 1
             entry.targetHud.Enabled = show and Settings.ShowDistance
             blastDistance.scaleLabel(entry.targetHud, entry.targetText, entry.expectedEnd)
@@ -2458,7 +2544,6 @@ RunService:BindToRenderStep("AutoLeadShotTracking", FREECAM_PRIORITY + 3, functi
             end
             if now >= (entry.nextLabel or 0) then
                 entry.nextLabel = now + 0.05
-                shotTracker.fillPath(entry, entry.progress or 0)
                 local meters = (entry.expectedEnd - entry.start).Magnitude / 2.7777778
                 local eta = entry.eta and entry.eta > 0.05 and string.format("ETA ~%.1fs", entry.eta) or "ETA unavailable"
                 entry.targetText.Text = string.format("%.0f m  ·  %s  ·  %.0f%%", meters, eta, (entry.progress or 0) * 100)
@@ -3072,6 +3157,7 @@ end)
 
 _G.AutoLeadAssistUnload = function()
     shotTracker.alive = false
+    shotTracker.flightGui:Destroy()
     if shotTracker.partsAdded then shotTracker.partsAdded:Disconnect() end
     for _, record in pairs(shotTracker.candidates) do shotTracker.releaseCandidate(record) end
     if shotTracker.notification then shotTracker.notification:Disconnect() end
