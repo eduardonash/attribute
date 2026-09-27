@@ -710,12 +710,12 @@ do
 
             local vehicleTab = window:Tab({ Name = "Vehicle", Columns = 2 })
             local supply = vehicleTab:Section({ Name = "Supplies", Side = 1 })
-            supply:Button({ Name = "Give Ammo Crate", Callback = function()
+            supply:Button():Add("Give Ammo Crate", function()
                 if extras.requestSupply then extras.requestSupply("AmmoPallet", "ammo crate") end
-            end })
-            supply:Button({ Name = "Give Jerry Can", Callback = function()
+            end)
+            supply:Button():Add("Give Jerry Can", function()
                 if extras.requestSupply then extras.requestSupply("Fuel", "jerry can") end
-            end })
+            end)
             supply:Paragraph({ Name = "Station required", Content = "Uses a nearby supply station within its normal pickup range. No remote spawning." })
             local tuning = vehicleTab:Section({ Name = "Turret & Firing", Side = 2 })
             settingToggle(tuning, "Turret Rotate Speed", "TurretSpeedEnabled", "Local occupied-turret speed override; restores on exit or disable.")
@@ -730,9 +730,9 @@ do
             local roles = serverTab:Section({ Name = "Group Roles", Side = 1 })
             settingToggle(roles, "Staff Detection", "StaffNotifications", "Notification only for verified Top Giun staff/developer role names.")
             settingToggle(roles, "Content Creator Check", "CreatorNotifications", "Notify when a Content Creator is present or joins.")
-            roles:Button({ Name = "Check Current Server", Callback = function()
+            roles:Button():Add("Check Current Server", function()
                 if extras.scanRoles then extras.scanRoles(true) end
-            end })
+            end)
             roles:Paragraph({ Name = "Detection action: Notify", Content = "Group 32966202 only. No auto-leave or other automatic action. Role lookups may be cached by Roblox." })
             vibeUi:CreateSettingsPage(window)
             uiInsertConn = UserInputService.InputBegan:Connect(function(input, processed)
