@@ -2782,6 +2782,74 @@ local function hookSingleWeaponModule(wm)
     table.insert(hookedWeaponModules, { wm = wm, orig = oldFB })
 end
 
+-- Native gunner controllers debit their own counters AFTER fireWeapon returns.
+-- Capture the caller's actual state, never a fixed upvalue index or a GC scan.
+local ammoReconcile = { restored = 0, skipped = 0 }
+function ammoReconcile.capture(caller, weapon, vehicle)
+    if not Settings.InfiniteAmmo or not debug.getupvalues or not caller then return end
+    local values = debug.getupvalues(caller)
+    local counters, owner
+    for _, value in pairs(values) do
+        if type(value) == "table" then
+            local candidate = rawget(value, weapon.Name)
+            if type(candidate) == "table" and type(rawget(candidate, "Mag")) == "number" then
+                if counters and counters ~= candidate then return end -- ambiguous owner
+                counters, owner = candidate, value
+            end
+        end
+    end
+    if not counters then return end -- direct/unsupported caller
+    local mag = weapon:FindFirstChild("Mag")
+    if not mag or mag.Parent ~= weapon or counters.Mag <= 0 or mag.Value ~= counters.Mag then return end
+    local snapshot = { caller = caller, counters = counters,
+        owner = owner, weapon = weapon, vehicle = vehicle, name = weapon.Name,
+        mag = mag, count = counters.Mag, entries = {} }
+    for key, value in pairs(counters) do
+        if type(value) == "table" and type(rawget(value, "value")) == "number" then
+            snapshot.entries[key] = { ref = value, count = value.value }
+        end
+    end
+    snapshot.others = rawget(counters, "Others")
+    return snapshot
+end
+function ammoReconcile.finish(snapshot, ammo)
+    if not snapshot then return end
+    task.defer(function()
+        local ok, err = pcall(function()
+            local s = snapshot
+            if not shotTracker.alive or not Settings.InfiniteAmmo or getActiveTank() ~= s.vehicle
+                or s.weapon.Parent == nil or s.mag.Parent ~= s.weapon
+                or rawget(s.owner, s.name) ~= s.counters then return end
+            local stillOwned = false
+            for _, value in pairs(debug.getupvalues(s.caller)) do
+                if value == s.owner then stillOwned = true; break end
+            end
+            -- A reload, another writer or overlapping burst must not be overwritten.
+            if not stillOwned or s.counters.Mag ~= s.count - 1 or s.mag.Value ~= s.count - 1 then
+                ammoReconcile.skipped = ammoReconcile.skipped + 1
+                return
+            end
+            s.mag.Value = s.count
+            s.counters.Mag = s.count
+            local entry = s.entries[ammo]
+            if entry and entry.count > 0 and rawget(s.counters, ammo) == entry.ref
+                and entry.ref.value == entry.count - 1 then
+                local folder = s.weapon:FindFirstChild("AmmoLimitFolder")
+                local counter = folder and folder:FindFirstChild(ammo)
+                if not counter or counter.Value == entry.count - 1 then
+                    if counter then counter.Value = entry.count end
+                    entry.ref.value = entry.count
+                end
+            elseif not entry and type(s.others) == "number" and s.others > 0
+                and s.counters.Others == s.others - 1 then
+                s.counters.Others = s.others
+            end
+            ammoReconcile.restored = ammoReconcile.restored + 1
+        end)
+        if not ok then ammoReconcile.error = tostring(err) end
+    end)
+end
+
 local function installHooks()
     -- 1. Hook WeaponModule from ClientHandler environment
     pcall(function()
@@ -2814,7 +2882,15 @@ local function installHooks()
                 -- Do not use 'enabled and false or p60': false would fall through.
                 local reloadAfterShot = p60
                 if Settings.InfiniteAmmo then reloadAfterShot = false end
+                local ammoSnapshot
+                if Settings.InfiniteAmmo and debug.info then
+                    local ok, snapshot = pcall(ammoReconcile.capture, debug.info(2, "f"), u58, p59)
+                    if ok then ammoSnapshot = snapshot else ammoReconcile.error = tostring(snapshot) end
+                end
                 local results = table.pack(oldFireWeapon(p56, p57, u58, p59, reloadAfterShot, p61, p62, p63))
+                if results[1] == true and shotTracker.serial > before then
+                    ammoReconcile.finish(ammoSnapshot, results[2])
+                end
                 if shotTracker.serial == before then
                     shotTracker.reject(shotTracker.gameErrorAt and os.clock() - shotTracker.gameErrorAt < 0.2
                         and shotTracker.gameError or aimCache.fireBlock or "Game did not launch a projectile")
@@ -2907,6 +2983,8 @@ _G.AutoLeadAssistDiagnostics = function()
         autoLead = Settings.AutoLead,
         autoBallistic = Settings.AutoBallistic,
         infiniteAmmo = Settings.InfiniteAmmo,
+        ammoReconcile = { restored = ammoReconcile.restored, skipped = ammoReconcile.skipped,
+            error = ammoReconcile.error },
         weaponHook = hookedWeaponHandler ~= nil,
         directFireReady = veh and shotCodeByVehicle[veh] ~= nil or false,
         directFireError = lastDirectFireError,

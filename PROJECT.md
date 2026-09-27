@@ -111,6 +111,7 @@ Impact and shot-readout labels use bright text with a dark stroke over a faint d
 ### Settings
 
 - `InfiniteAmmo` defaults **off** and is remembered across reloads. **Aim → Assist → Infinite Ammo / No Reload** gates the previous always-on local reload suppression. Off preserves native callers' reload flags; direct F/driver shots request normal unloading. On forces the local flag false. It does not replenish server ammunition, reload an already empty weapon, or bypass other firing checks. Changes apply to subsequent shots without reinstalling hooks.
+  - Magazine-based gunner controllers also debit a separate local ammo table after a successful handler return. The toggle now snapshots the exact caller-owned table and defers reconciliation until that debit has run. It requires both a successful native return and an observed dispatch, and restores only matching single-step decrements. Direct calls without that state, unsupported layouts, overlapping bursts, reloads, changed owners/vehicles, disabled settings and unload are left untouched. No fixed upvalue indices, GC scans, repeated refill loop or additional firing calls are used. Errors and restored/skipped counts are exposed under diagnostic `ammoReconcile`. This remains client-side behavior, not a guarantee of server ammunition or accepted damage.
 
 - `DisableExplosionShake` defaults on and is remembered. **Freecam → Camera → Disable Explosion Shake** suppresses named/default explosion camera shake and the mass-based camera-shake helper shared by shell impacts and flybys. It does not suppress damage, sounds, particles, physical recoil or alter the camera directly. The muzzle-recoil toggle remains separate. Original effect functions are restored on disable/unload, without overwriting later replacements by other code. Effects already scheduled before enabling may finish their existing decay.
 
@@ -186,6 +187,8 @@ The first revision still delayed or missed shell discovery, and the user reporte
 ### Optional ammo/reload suppression (2026-09-26)
 
 Confirmed from the current weapon-handler source that its fifth argument controls the local unload transition and FireUnload request. Added an off-by-default toggle instead of always overriding this argument. Full-source compilation and isolated argument/return-preservation tests passed for true, false and nil native flags with the toggle on/off. No live shot was fired, and this revision was not reloaded during implementation.
+
+Gunner magazine follow-up: native `TurretsNew` source independently decrements its captured weapon ammo table and `Mag` after the handler succeeds, explaining why reload suppression alone differs from direct driver firing. Added guarded post-return reconciliation for magazine-based callers. Full-source compilation and 12 isolated mocked-state assertions passed (matching debit, disabled toggle, direct caller, empty magazine, unload, changed vehicle/owner, burst, reload and absent debit). No weapon was fired by the assistant. The connected client switched to a Grad during inspection; PT-76E live verification is still pending. Bursts or other counter changes that do not exactly match one native decrement are deliberately skipped.
 
 ### Player ESP library integration (2026-09-26)
 
