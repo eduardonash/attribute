@@ -717,6 +717,11 @@ do
                 if extras.requestSupply then extras.requestSupply("Fuel", "jerry can") end
             end)
             supply:Paragraph({ Name = "Station required", Content = "Uses a nearby supply station within its normal pickup range. No remote spawning." })
+            supply:Button():Add("Check Pickup Availability", function()
+                if extras.showPickupAudit then extras.showPickupAudit() end
+            end)
+            extras.pickupReadout = supply:Paragraph({ Name = "Pickup Audit (read-only)",
+                Content = "Not checked. Press Check Pickup Availability for a snapshot.\nServer validation unknown." })
             local tuning = vehicleTab:Section({ Name = "Turret & Firing", Side = 2 })
             settingToggle(tuning, "Turret Rotate Speed", "TurretSpeedEnabled", "Local occupied-turret speed override; restores on exit or disable.")
             tuning:Slider({ Name = "Turret Rotate Speed Slider", Min = 0.25, Max = 3,
@@ -2897,6 +2902,78 @@ extras.left = Players.PlayerRemoving:Connect(function(player)
     extras.roleCache[player], extras.notified[player] = nil, nil
 end)
 
+-- On-demand local inventory only. No activation, movement or remote calls.
+function extras.auditPickups()
+    local char = lp.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local map = workspace:FindFirstChild("Map")
+    local stations = map and map:FindFirstChild("ToolGivers")
+    local report = { checkedAt = os.time(), serverValidation = "UNKNOWN",
+        grantConfirmed = false, mapAvailable = stations ~= nil, characterAvailable = root ~= nil,
+        alive = hum ~= nil and hum.Health > 0, activationAvailable = type(fireclickdetector) == "function",
+        supplies = {} }
+    local backpack = lp:FindFirstChild("Backpack")
+    for _, spec in ipairs({ { "AmmoPallet", "AmmoCrate", "Ammo crate" }, { "Fuel", "Jerrycan", "Jerry can" } }) do
+        local row = { label = spec[3], stationCount = 0, eligibleCount = 0,
+            toolPresent = false, availability = "Unavailable" }
+        for _, container in pairs({ backpack = backpack, character = char }) do
+            local tool = container:FindFirstChild(spec[2])
+            if tool and tool:IsA("Tool") then row.toolPresent = true end
+        end
+        if stations then
+            for _, station in ipairs(stations:GetChildren()) do
+                if station.Name == spec[1] and station:IsA("Model") then
+                    local detector = station:FindFirstChildOfClass("ClickDetector")
+                    if detector then
+                        row.stationCount = row.stationCount + 1
+                        if root then
+                            -- Same pivot/range test as the unchanged pickup handler.
+                            local distance = (station:GetPivot().Position - root.Position).Magnitude
+                            local range = detector.MaxActivationDistance
+                            if distance <= range then row.eligibleCount = row.eligibleCount + 1 end
+                            if not row.nearest or distance < row.nearest.distance then
+                                row.nearest = { distance = distance, range = range,
+                                    withinRange = distance <= range, mechanism = "ClickDetector" }
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        if not stations then row.availability = "Stations not loaded"
+        elseif row.stationCount == 0 then row.availability = "No supported station found"
+        elseif not root then row.availability = "Character position unavailable"
+        elseif not report.alive then row.availability = "Character not alive"
+        elseif row.eligibleCount == 0 then row.availability = "Outside pickup range"
+        elseif not report.activationAvailable then row.availability = "In range; use station manually"
+        else row.availability = "In range; request available (grant unverified)" end
+        report.supplies[spec[1]] = row
+    end
+    return report
+end
+function extras.showPickupAudit()
+    if not extras.alive then return end
+    local ok, report = pcall(extras.auditPickups)
+    if not ok then
+        if extras.pickupReadout then extras.pickupReadout:SetText("Audit unavailable. Server validation unknown.") end
+        extras.pickupAuditError = tostring(report)
+        return
+    end
+    extras.pickupAuditError, extras.lastPickupAudit = nil, report
+    local lines = { "Snapshot — refresh after moving." }
+    for _, name in ipairs({ "AmmoPallet", "Fuel" }) do
+        local row = report.supplies[name]
+        lines[#lines + 1] = row.label .. ": " .. row.availability
+        if row.nearest then
+            lines[#lines + 1] = string.format("Nearest: %.1f studs / %.1f-stud range", row.nearest.distance, row.nearest.range)
+        end
+        lines[#lines + 1] = row.toolPresent and "Tool already present; contents unknown." or "Tool not found in inventory."
+    end
+    lines[#lines + 1] = "Server validation unknown. No pickup was attempted."
+    if extras.pickupReadout then extras.pickupReadout:SetText(table.concat(lines, "\n")) end
+end
+
 function extras.requestSupply(stationName, label)
     if not extras.alive or os.clock() - (extras.supplyAt or 0) < 1 then return end
     extras.supplyAt = os.clock()
@@ -3267,6 +3344,8 @@ _G.AutoLeadAssistDiagnostics = function()
         infiniteAmmo = Settings.InfiniteAmmo,
         vehicleExtras = { localEdits = #extras.edits, error = extras.tuningError,
             turretSpeedEnabled = Settings.TurretSpeedEnabled, rapidFireEnabled = Settings.TankRapidFire },
+        pickupAudit = extras.lastPickupAudit,
+        pickupAuditError = extras.pickupAuditError,
         groupChecks = { groupId = 32966202, error = extras.roleError,
             staffEnabled = Settings.StaffNotifications, creatorEnabled = Settings.CreatorNotifications },
         ammoReconcile = { restored = ammoReconcile.restored, skipped = ammoReconcile.skipped,
