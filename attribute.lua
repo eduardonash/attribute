@@ -96,6 +96,12 @@ local Settings = {
     AutoLead = true,
     AutoBallistic = rememberedSettings.AutoBallistic == true,
     InfiniteAmmo = rememberedSettings.InfiniteAmmo == true,
+    TurretSpeedEnabled = rememberedSettings.TurretSpeedEnabled == true,
+    TurretSpeedMultiplier = math.clamp(tonumber(rememberedSettings.TurretSpeedMultiplier) or 1, 0.25, 3),
+    TankRapidFire = rememberedSettings.TankRapidFire == true,
+    RapidFireMultiplier = math.clamp(tonumber(rememberedSettings.RapidFireMultiplier) or 2, 1, 5),
+    StaffNotifications = rememberedSettings.StaffNotifications ~= false,
+    CreatorNotifications = rememberedSettings.CreatorNotifications ~= false,
     EnemyTankESP = rememberedSettings.EnemyTankESP ~= false,
     ZeroEnemyArmor = rememberedSettings.ZeroEnemyArmor ~= false,
     PlayerESP = rememberedSettings.PlayerESP ~= false,
@@ -477,6 +483,15 @@ end
 -- VibeUI owns the settings menu; this script keeps only the impact HUD in
 -- AutoLeadOverlay. A failed library fetch does not disable aiming or visuals.
 local vibeUi = nil
+local extras = { alive = true, edits = {}, roleCache = {}, pending = {}, notified = {} }
+function extras.notify(message)
+    if not extras.alive then return end
+    pcall(function()
+        game:GetService("StarterGui"):SetCore("SendNotification", {
+            Title = "Attribute", Text = message, Duration = 7
+        })
+    end)
+end
 local uiInsertConn = nil
 local freecamHint = nil
 local freecamToggleHandle = nil
@@ -693,6 +708,32 @@ do
                 Content = "Only enemy tank values in this client are changed. Server-side damage rules may ignore them."
             })
 
+            local vehicleTab = window:Tab({ Name = "Vehicle", Columns = 2 })
+            local supply = vehicleTab:Section({ Name = "Supplies", Side = 1 })
+            supply:Button({ Name = "Give Ammo Crate", Callback = function()
+                if extras.requestSupply then extras.requestSupply("AmmoPallet", "ammo crate") end
+            end })
+            supply:Button({ Name = "Give Jerry Can", Callback = function()
+                if extras.requestSupply then extras.requestSupply("Fuel", "jerry can") end
+            end })
+            supply:Paragraph({ Name = "Station required", Content = "Uses a nearby supply station within its normal pickup range. No remote spawning." })
+            local tuning = vehicleTab:Section({ Name = "Turret & Firing", Side = 2 })
+            settingToggle(tuning, "Turret Rotate Speed", "TurretSpeedEnabled", "Local occupied-turret speed override; restores on exit or disable.")
+            tuning:Slider({ Name = "Turret Rotate Speed Slider", Min = 0.25, Max = 3,
+                Default = Settings.TurretSpeedMultiplier, Decimals = 2, Suffix = "x",
+                Callback = function(v) Settings.TurretSpeedMultiplier = math.clamp(tonumber(v) or 1, 0.25, 3) end })
+            settingToggle(tuning, "Tank Rapid Fire", "TankRapidFire", "Shortens supported RPM-based local intervals; release/repress fire after changing. Server reload rules still apply.")
+            tuning:Slider({ Name = "Rapid Fire Multiplier", Min = 1, Max = 5,
+                Default = Settings.RapidFireMultiplier, Decimals = 1, Suffix = "x",
+                Callback = function(v) Settings.RapidFireMultiplier = math.clamp(tonumber(v) or 2, 1, 5) end })
+            local serverTab = window:Tab({ Name = "Server", Columns = 1 })
+            local roles = serverTab:Section({ Name = "Group Roles", Side = 1 })
+            settingToggle(roles, "Staff Detection", "StaffNotifications", "Notification only for verified Top Giun staff/developer role names.")
+            settingToggle(roles, "Content Creator Check", "CreatorNotifications", "Notify when a Content Creator is present or joins.")
+            roles:Button({ Name = "Check Current Server", Callback = function()
+                if extras.scanRoles then extras.scanRoles(true) end
+            end })
+            roles:Paragraph({ Name = "Detection action: Notify", Content = "Group 32966202 only. No auto-leave or other automatic action. Role lookups may be cached by Roblox." })
             vibeUi:CreateSettingsPage(window)
             uiInsertConn = UserInputService.InputBegan:Connect(function(input, processed)
                 if not processed and input.KeyCode == Enum.KeyCode.Insert then
@@ -2800,6 +2841,158 @@ refreshAimCache = function()
     visualDiagnostics.aimMs = (os.clock() - now) * 1000
 end
 
+extras.staffRoles = { Moderator = true, ["Non TC Dev"] = true, ["Game Admin"] = true,
+    ["TC Dev"] = true, Administrator = true, Holder = true }
+function extras.classifyRole(role)
+    return extras.staffRoles[role] and "staff" or (role == "Content Creator" and "creator" or nil)
+end
+function extras.queueRole(player, force)
+    if player == lp or extras.pending[player] or not extras.alive then return end
+    extras.pending[player] = true
+    extras.roleQueue = extras.roleQueue or {}
+    extras.roleQueue[#extras.roleQueue + 1] = { player = player, force = force }
+    if extras.roleWorker then return end
+    extras.roleWorker = true
+    task.spawn(function()
+        while extras.alive and #extras.roleQueue > 0 do
+            local item = table.remove(extras.roleQueue, 1)
+            local p = item.player
+            if p.Parent == Players then
+                local role = not item.force and extras.roleCache[p]
+                local ok = true
+                if not role then ok, role = pcall(p.GetRoleInGroup, p, 32966202) end
+                if extras.alive and p.Parent == Players then
+                    if ok then
+                        extras.roleCache[p] = role
+                        local category = extras.classifyRole(role)
+                        local enabled = category == "staff" and Settings.StaffNotifications
+                            or category == "creator" and Settings.CreatorNotifications
+                        if enabled and (item.force or extras.notified[p] ~= role) then
+                            extras.notified[p] = role
+                            extras.notify(p.DisplayName .. " (@" .. p.Name .. ") — " .. role .. " is in this server")
+                        end
+                    else
+                        extras.roleError = tostring(role)
+                        if not extras.roleErrorShown then
+                            extras.roleErrorShown = true
+                            extras.notify("Some group checks failed; staff presence is unknown for those players.")
+                        end
+                    end
+                end
+            end
+            extras.pending[p] = nil
+            task.wait(0.2) -- one yielding lookup worker, not one per-frame scan
+        end
+        extras.roleWorker = false
+    end)
+end
+function extras.scanRoles(force)
+    for _, player in ipairs(Players:GetPlayers()) do extras.queueRole(player, force) end
+    if force then extras.notify("Checking current players' Top Giun roles…") end
+end
+extras.joined = Players.PlayerAdded:Connect(function(player)
+    if Settings.StaffNotifications or Settings.CreatorNotifications then extras.queueRole(player) end
+end)
+extras.left = Players.PlayerRemoving:Connect(function(player)
+    extras.roleCache[player], extras.notified[player] = nil, nil
+end)
+
+function extras.requestSupply(stationName, label)
+    if not extras.alive or os.clock() - (extras.supplyAt or 0) < 1 then return end
+    extras.supplyAt = os.clock()
+    local char = lp.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    local map = workspace:FindFirstChild("Map")
+    local stations = map and map:FindFirstChild("ToolGivers")
+    if not root or not stations then extras.notify("Supply stations or your character are unavailable."); return end
+    if type(fireclickdetector) ~= "function" then extras.notify("Use the supply station directly; click activation is unavailable."); return end
+    local nearest, distance = nil, math.huge
+    for _, station in ipairs(stations:GetChildren()) do
+        if station.Name == stationName and station:IsA("Model") then
+            local detector = station:FindFirstChildOfClass("ClickDetector")
+            local d = (station:GetPivot().Position - root.Position).Magnitude
+            if detector and d <= detector.MaxActivationDistance and d < distance then
+                nearest, distance = detector, d
+            end
+        end
+    end
+    if not nearest then extras.notify("Move within pickup range of a " .. label .. " supply station."); return end
+    local ok = pcall(fireclickdetector, nearest)
+    extras.notify(ok and ("Requested " .. label .. "; the station/server decides whether to grant it.")
+        or "Station activation failed; use it directly.")
+end
+
+-- Reversible local table edits; neither helper emits shots or changes remotes.
+function extras.restoreEdits()
+    for _, edit in ipairs(extras.edits) do
+        if rawget(edit.target, edit.key) == edit.applied then edit.target[edit.key] = edit.original end
+    end
+    table.clear(extras.edits)
+end
+function extras.tune(target, key, multiplier, inverse)
+    if type(target) ~= "table" or type(rawget(target, key)) ~= "number" or target[key] <= 0 then return end
+    if table.isfrozen and table.isfrozen(target) then return end
+    local edit
+    for _, candidate in ipairs(extras.edits) do
+        if candidate.target == target and candidate.key == key then edit = candidate; break end
+    end
+    if not edit then
+        edit = { target = target, key = key, original = target[key], applied = target[key] }
+        extras.edits[#extras.edits + 1] = edit
+    end
+    edit.wanted = true
+    if edit.conflict or target[key] ~= edit.applied then edit.conflict = true; return end
+    edit.applied = inverse and math.max(0.05, edit.original / multiplier) or edit.original * multiplier
+    target[key] = edit.applied
+end
+function extras.updateTuning()
+    for _, edit in ipairs(extras.edits) do edit.wanted = false end
+    local veh = (Settings.TurretSpeedEnabled or Settings.TankRapidFire) and getActiveTank()
+    local w = veh and getActiveWeaponData(veh)
+    local hum = lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
+    local control = w and w.turret and w.turret:FindFirstChild("Control")
+    if hum and hum.SeatPart and control and control.Value == hum.SeatPart then
+        if Settings.TurretSpeedEnabled then
+            local module = w.turret:FindFirstChild("TurretInfo")
+            if module and module:IsA("ModuleScript") then
+                local data = require(module)
+                local function axes(config)
+                    if type(config) ~= "table" then return end
+                    extras.tune(config.horizontal, 3, Settings.TurretSpeedMultiplier)
+                    extras.tune(config.vertical, 3, Settings.TurretSpeedMultiplier)
+                end
+                axes(data.anglelimits)
+                axes(data.FCS)
+                for _, optic in pairs(type(data.Cameras) == "table" and data.Cameras or {}) do
+                    if type(optic) == "table" then axes(optic.FCS) end
+                end
+            end
+        end
+        if Settings.TankRapidFire then
+            -- Native code uses RPM as a delay (RPM / MuzzleCount), not shots/minute.
+            extras.tune(w.shellData, "RPM", Settings.RapidFireMultiplier, true)
+        end
+    end
+    for i = #extras.edits, 1, -1 do
+        local edit = extras.edits[i]
+        if not edit.wanted then
+            if edit.target[edit.key] == edit.applied then edit.target[edit.key] = edit.original end
+            table.remove(extras.edits, i)
+        end
+    end
+end
+extras.tick = RunService.Heartbeat:Connect(function()
+    if not extras.alive or os.clock() < (extras.nextTick or 0) then return end
+    extras.nextTick = os.clock() + 0.25
+    local enabled = (Settings.StaffNotifications and "staff" or "") .. (Settings.CreatorNotifications and "creator" or "")
+    if enabled ~= extras.roleMode then
+        extras.roleMode = enabled
+        if enabled ~= "" then extras.scanRoles(false) end
+    end
+    local ok, err = pcall(extras.updateTuning)
+    if not ok then extras.tuningError = tostring(err); extras.restoreEdits() end
+end)
+
 local function hookSingleWeaponModule(wm)
     if not wm or wm._AutoLeadHooked or type(wm.FireBullet) ~= "function" then return end
     wm._AutoLeadHooked = true
@@ -3072,6 +3265,10 @@ _G.AutoLeadAssistDiagnostics = function()
         autoLead = Settings.AutoLead,
         autoBallistic = Settings.AutoBallistic,
         infiniteAmmo = Settings.InfiniteAmmo,
+        vehicleExtras = { localEdits = #extras.edits, error = extras.tuningError,
+            turretSpeedEnabled = Settings.TurretSpeedEnabled, rapidFireEnabled = Settings.TankRapidFire },
+        groupChecks = { groupId = 32966202, error = extras.roleError,
+            staffEnabled = Settings.StaffNotifications, creatorEnabled = Settings.CreatorNotifications },
         ammoReconcile = { restored = ammoReconcile.restored, skipped = ammoReconcile.skipped,
             error = ammoReconcile.error },
         weaponHook = hookedWeaponHandler ~= nil,
@@ -3160,6 +3357,11 @@ end)
 -- ===================================================================
 
 _G.AutoLeadAssistUnload = function()
+    extras.alive = false
+    extras.tick:Disconnect()
+    extras.joined:Disconnect()
+    extras.left:Disconnect()
+    extras.restoreEdits()
     shotTracker.alive = false
     shotTracker.flightGui:Destroy()
     if shotTracker.partsAdded then shotTracker.partsAdded:Disconnect() end
