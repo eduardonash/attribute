@@ -549,7 +549,7 @@ do
             local path = trajectoryTab:Section({ Name = "Path", Side = 1 })
             settingToggle(path, "Trajectory Beam", "Trajectory", "Show the predicted collision-aware path.")
             settingToggle(path, "Barrel Path", "ShowBallistic", "Also show the unassisted barrel path.")
-            settingToggle(path, "Own Shell Effect", "OwnShellHighlight", "ForceField effect around your observed projectile.")
+            settingToggle(path, "Own Shell Effect", "OwnShellHighlight", "Native shell outline, with a tiny hollow ring for distant or attachment-only shells.")
             settingToggle(path, "Shell Flight Progress", "ShotProgress", "Fill the launch path as the real shell travels.")
             settingToggle(path, "Shot Confirmation", "ShotStatus", "Distinguish clicks, launch, impact, and rejected shots.")
             local impact = trajectoryTab:Section({ Name = "Impact", Side = 2 })
@@ -2247,23 +2247,22 @@ function shotTracker.attach(entry, state)
     -- Keep the cloned label's automatic, tightly padded text bounds.
     entry.visuals[#entry.visuals + 1] = entry.targetHud
     entry.part = state.projectile or (state.physicalprojectile and state.physicalprojectile.proj)
-    if entry.part then
-        -- Cosmetic only: don't alter the native Part or Attachment projectile.
-        entry.shellFx = Instance.new("Part")
-        entry.shellFx.Name = "OwnShellForceField"
-        entry.shellFx.Shape = Enum.PartType.Ball
-        entry.shellFx.Size = Vector3.new(1.2, 1.2, 3.2)
-        entry.shellFx.Material = Enum.Material.ForceField
-        entry.shellFx.Color = THEME.FlightStart
-        entry.shellFx.Transparency = 0.2
-        entry.shellFx.Anchored = true
-        entry.shellFx.CanCollide = false
-        entry.shellFx.CanTouch = false
-        entry.shellFx.CanQuery = false
-        entry.shellFx.CastShadow = false
-        entry.shellFx.CFrame = CFrame.new(state.position)
-        entry.shellFx.Parent = visualContainer
-        entry.visuals[#entry.visuals + 1] = entry.shellFx
+    -- Outline only the real projectile; never create an enlarged proxy ball or
+    -- adorn an attachment's ancestor model (which could be the entire tank).
+    local adorn = entry.part
+    if adorn and adorn:IsA("Attachment") then adorn = adorn.Parent end
+    if adorn and adorn:IsA("BasePart") then
+        entry.shellAdornee = adorn
+        entry.shellHighlight = Instance.new("Highlight")
+        entry.shellHighlight.Name = "OwnShellOutline"
+        entry.shellHighlight.Adornee = adorn
+        entry.shellHighlight.FillTransparency = 1
+        entry.shellHighlight.OutlineTransparency = 0
+        entry.shellHighlight.OutlineColor = THEME.FlightStart
+        entry.shellHighlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+        entry.shellHighlight.Enabled = false
+        entry.shellHighlight.Parent = visualContainer
+        entry.visuals[#entry.visuals + 1] = entry.shellHighlight
     end
     entry.status = "AIRBORNE"
     shotTracker.observed = shotTracker.observed + 1
@@ -2340,13 +2339,13 @@ function shotTracker.makeFlightOverlay(entry)
         border.AnchorPoint = Vector2.new(0.5, 0.5)
         border.BorderSizePixel = 0
         border.BackgroundColor3 = THEME.Ink
-        border.BackgroundTransparency = 0.12
+        border.BackgroundTransparency = 0.55
         border.Visible = false
         border.Parent = layer
         local line = Instance.new("Frame")
         line.AnchorPoint = Vector2.new(0.5, 0.5)
         line.Position = UDim2.fromScale(0.5, 0.5)
-        line.Size = UDim2.new(1, 0, 0, 2)
+        line.Size = UDim2.new(1, 0, 0, 1)
         line.BorderSizePixel = 0
         line.Parent = border
         entry.lines[i] = { border = border, line = line }
@@ -2354,9 +2353,9 @@ function shotTracker.makeFlightOverlay(entry)
     local marker = Instance.new("Frame")
     marker.Name = "ObservedShell"
     marker.AnchorPoint = Vector2.new(0.5, 0.5)
-    marker.Size = UDim2.fromOffset(9, 9)
+    marker.Size = UDim2.fromOffset(5, 5)
     marker.BackgroundColor3 = THEME.FlightStart
-    marker.BackgroundTransparency = 0.2
+    marker.BackgroundTransparency = 1
     marker.BorderSizePixel = 0
     marker.ZIndex = 3
     marker.Parent = layer
@@ -2364,7 +2363,7 @@ function shotTracker.makeFlightOverlay(entry)
     corner.CornerRadius = UDim.new(1, 0)
     corner.Parent = marker
     local stroke = Instance.new("UIStroke")
-    stroke.Color, stroke.Thickness = THEME.Ink, 2
+    stroke.Color, stroke.Thickness = THEME.FlightStart, 1
     stroke.Parent = marker
     entry.shellMarker = marker
 end
@@ -2415,7 +2414,7 @@ function shotTracker.drawFlight(entry, cam)
         if not item.border.Visible then return end
         local delta = pb - pa
         item.border.Position = UDim2.fromOffset((pa.X + pb.X) / 2, (pa.Y + pb.Y) / 2)
-        item.border.Size = UDim2.fromOffset(math.max(delta.Magnitude, 0.1), complete and 4 or 3)
+        item.border.Size = UDim2.fromOffset(math.max(delta.Magnitude, 0.1), 2)
         item.border.Rotation = math.deg(math.atan2(delta.Y, delta.X))
         item.line.BackgroundColor3 = complete and THEME.FlightStart:Lerp(THEME.FlightEnd, fraction)
             or Color3.fromRGB(207, 218, 232)
@@ -2434,7 +2433,18 @@ function shotTracker.drawFlight(entry, cam)
         previous = point
     end
     local point, visible = cam:WorldToViewportPoint(position)
-    entry.shellMarker.Visible = Settings.OwnShellHighlight and visible and point.Z > 0
+    local adorn = entry.shellAdornee
+    local usable = entry.shellHighlight and adorn and adorn.Parent ~= nil
+        and adorn.Transparency < 1 and adorn.LocalTransparencyModifier < 1 and point.Z > 0
+    if usable then
+        local pixels = adorn.Size.Magnitude * cam.ViewportSize.Y
+            / (2 * math.tan(math.rad(cam.FieldOfView) / 2) * math.max(point.Z, 0.1))
+        usable = pixels >= 3
+    end
+    if entry.shellHighlight then
+        entry.shellHighlight.Enabled = Settings.OwnShellHighlight and usable == true
+    end
+    entry.shellMarker.Visible = Settings.OwnShellHighlight and not usable and visible and point.Z > 0
     entry.shellMarker.Position = UDim2.fromOffset(point.X, point.Y)
 end
 
@@ -2536,12 +2546,6 @@ RunService:BindToRenderStep("AutoLeadShotTracking", FREECAM_PRIORITY + 3, functi
             entry.zone.Transparency = show and 0.48 or 1
             entry.targetHud.Enabled = show and Settings.ShowDistance
             blastDistance.scaleLabel(entry.targetHud, entry.targetText, entry.expectedEnd)
-            if entry.shellFx then
-                entry.shellFx.Transparency = Settings.OwnShellHighlight and 0.2 or 1
-                local velocity = state.velocity or entry.initialVelocity
-                entry.shellFx.CFrame = velocity.Magnitude > 0.01
-                    and CFrame.lookAt(state.position, state.position + velocity) or CFrame.new(state.position)
-            end
             if now >= (entry.nextLabel or 0) then
                 entry.nextLabel = now + 0.05
                 local meters = (entry.expectedEnd - entry.start).Magnitude / 2.7777778
