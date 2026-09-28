@@ -112,6 +112,7 @@ local Settings = {
     TankOccupiedOnly = false,
     TankTeamCheck = true,
     ModuleOutline = false,
+    ModuleLineThickness = math.floor(math.clamp(tonumber(rememberedSettings.ModuleLineThickness) or 1, 1, 5) + 0.5),
     ModuleFilled = false,
     ModuleEngine = true,
     ModuleAmmo = true,
@@ -795,6 +796,11 @@ do
             }) do settingToggle(tanks, option[1], option[2], "Uses the shared ESP distance limit.") end
             local modules = espTab:Section({ Name = "Tank Modules", Side = 2 })
             settingToggle(modules, "Outline", "ModuleOutline", "Outline actual streamed damage modules; not a penetration guarantee.")
+            modules:Slider({ Name = "Outline Thickness", Min = 1, Max = 5, Decimals = 1,
+                Default = Settings.ModuleLineThickness, Suffix = " px", Flag = "ALA_ModuleLineThickness",
+                Callback = function(v)
+                    Settings.ModuleLineThickness = math.floor(math.clamp(tonumber(v) or 1, 1, 5) + 0.5)
+                end })
             settingToggle(modules, "Filled", "ModuleFilled", "Translucent module volumes, separate from the whole-tank highlight.")
             settingToggle(modules, "Engine", "ModuleEngine", "Mark the engine assembly.")
             settingToggle(modules, "Ammo", "ModuleAmmo", "Mark hull/turret ammo compartments.")
@@ -2029,7 +2035,7 @@ function espStats.drawOutline(mark, part, camera, color, enabled)
                     local d = last - first
                     if d.Magnitude >= 0.5 then
                         line.Position = UDim2.fromOffset((first.X+last.X)*0.5,(first.Y+last.Y)*0.5)
-                        line.Size = UDim2.fromOffset(d.Magnitude,1)
+                        line.Size = UDim2.fromOffset(d.Magnitude, Settings.ModuleLineThickness)
                         line.Rotation = math.deg(math.atan2(d.Y,d.X))
                         line.BackgroundColor3 = color
                         line.BackgroundTransparency = 0.45
