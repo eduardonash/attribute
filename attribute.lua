@@ -2032,7 +2032,7 @@ function espStats.drawOutline(mark, part, camera, color, enabled)
                         line.Size = UDim2.fromOffset(d.Magnitude,1)
                         line.Rotation = math.deg(math.atan2(d.Y,d.X))
                         line.BackgroundColor3 = color
-                        line.BackgroundTransparency = 0
+                        line.BackgroundTransparency = 0.45
                         line.Visible = true
                     end
                 end
