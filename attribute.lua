@@ -103,6 +103,23 @@ local Settings = {
     StaffNotifications = rememberedSettings.StaffNotifications ~= false,
     CreatorNotifications = rememberedSettings.CreatorNotifications ~= false,
     EnemyTankESP = rememberedSettings.EnemyTankESP ~= false,
+    TankBoxes = false,
+    TankNames = false,
+    TankClass = false,
+    TankDistance = false,
+    TankDistanceFade = true,
+    HelicopterESP = false,
+    TankOccupiedOnly = false,
+    TankTeamCheck = true,
+    ModuleOutline = false,
+    ModuleFilled = false,
+    ModuleEngine = true,
+    ModuleAmmo = true,
+    ModuleDistance = 400,
+    ModuleEngineColor = Color3.fromRGB(224, 224, 85),
+    ModuleAmmoColor = Color3.fromRGB(238, 238, 245),
+    NoGrass = false,
+    NoTrees = false,
     ZeroEnemyArmor = rememberedSettings.ZeroEnemyArmor ~= false,
     PlayerESP = rememberedSettings.PlayerESP ~= false,
     ESPBoxes = rememberedSettings.ESPBoxes ~= false,
@@ -549,6 +566,12 @@ local vibeUi = nil
 local extras = { alive = true, edits = {}, roleCache = {}, pending = {}, notified = {} }
 function extras.notify(message)
     if not extras.alive then return end
+    if vibeUi and type(vibeUi.Notification) == "function" then
+        local ok = pcall(function()
+            vibeUi:Notification({ Title = "Attribute", Description = message, Duration = 4, Sound = "" })
+        end)
+        if ok then return end
+    end
     pcall(function()
         game:GetService("StarterGui"):SetCore("SendNotification", {
             Title = "Attribute", Text = message, Duration = 7
@@ -629,7 +652,7 @@ do
             settingToggle(path, "Barrel Path", "ShowBallistic", "Also show the unassisted barrel path.")
             settingToggle(path, "Own Shell Effect", "OwnShellHighlight", "Native shell outline, with a tiny hollow ring for distant or attachment-only shells.")
             settingToggle(path, "Shell Flight Progress", "ShotProgress", "Fill the launch path as the real shell travels.")
-            settingToggle(path, "Shot Confirmation", "ShotStatus", "Distinguish clicks, launch, impact, and rejected shots.")
+            settingToggle(path, "Shot Notifications", "ShotStatus", "UI-library notifications after an actual shot dispatch; rapid bursts are grouped.")
             local impact = trajectoryTab:Section({ Name = "Impact", Side = 2 })
             settingToggle(impact, "Explosion Radius", "ExplosionRadius", "Show a compact filled impact-zone cue.")
             settingToggle(impact, "Show Distance", "ShowDistance", "Show muzzle-to-zone distance beside the blast zone and in the HUD.")
@@ -729,7 +752,6 @@ do
 
             local espTab = window:Tab({ Name = "ESP", Columns = 2 })
             local espTargets = espTab:Section({ Name = "Targets", Side = 1 })
-            settingToggle(espTargets, "Enemy Tank Highlight", "EnemyTankESP", "Highlight nearby enemy tanks without labels.")
             settingToggle(espTargets, "Enemy Players", "PlayerESP", "Show nearby enemy player markers.")
             settingToggle(espTargets, "Player Names", "ESPNames", "Show only each enemy username.")
             settingToggle(espTargets, "Player Health Bar", "ESPHealth", "Show a slim bar beside each enemy.")
@@ -762,6 +784,31 @@ do
                 Name = "Distance",
                 Content = "Drag the slider or click its value box to type a precise range in studs."
             })
+
+            local tanks = espTab:Section({ Name = "Tank ESP", Side = 1 })
+            for _, option in ipairs({
+                {"Tank ESP", "EnemyTankESP"}, {"Box ESP", "TankBoxes"},
+                {"Names", "TankNames"}, {"Vehicle Class", "TankClass"},
+                {"Distance", "TankDistance"}, {"Distance Fade", "TankDistanceFade"},
+                {"Helicopter ESP", "HelicopterESP"}, {"Occupied Only", "TankOccupiedOnly"},
+                {"Team Check", "TankTeamCheck"}
+            }) do settingToggle(tanks, option[1], option[2], "Uses the shared ESP distance limit.") end
+            local modules = espTab:Section({ Name = "Tank Modules", Side = 2 })
+            settingToggle(modules, "Outline", "ModuleOutline", "Outline actual streamed damage modules; not a penetration guarantee.")
+            settingToggle(modules, "Filled", "ModuleFilled", "Translucent module volumes, separate from the whole-tank highlight.")
+            settingToggle(modules, "Engine", "ModuleEngine", "Mark the engine assembly.")
+            settingToggle(modules, "Ammo", "ModuleAmmo", "Mark hull/turret ammo compartments.")
+            modules:Label("Engine Color"):AddColorpicker({ Default = Settings.ModuleEngineColor,
+                Flag = "ALA_ModuleEngineColor", Callback = function(c) Settings.ModuleEngineColor = c end })
+            modules:Label("Ammo Color"):AddColorpicker({ Default = Settings.ModuleAmmoColor,
+                Flag = "ALA_ModuleAmmoColor", Callback = function(c) Settings.ModuleAmmoColor = c end })
+            modules:Slider({ Name = "Module Distance", Min = 0, Max = 50000, Decimals = 1,
+                Default = Settings.ModuleDistance, Suffix = " studs", Flag = "ALA_ModuleDistance",
+                Callback = function(v) Settings.ModuleDistance = math.clamp(tonumber(v) or 400, 0, 50000) end })
+            local worldTab = window:Tab({ Name = "World", Columns = 1 })
+            local foliage = worldTab:Section({ Name = "Foliage", Side = 1 })
+            settingToggle(foliage, "No Grass", "NoGrass", "Hide terrain decoration and recognized grass meshes locally.")
+            settingToggle(foliage, "No Trees", "NoTrees", "Hide recognized map trees locally. Collisions remain; restored on disable/unload.")
 
             local armorTab = window:Tab({ Name = "Armor", Columns = 2 })
             local armorControls = armorTab:Section({ Name = "Enemy Tanks", Side = 1 })
@@ -2023,16 +2070,23 @@ end
 
 local function scanEnemyTanks(origin)
     local seen = {}
+    local moduleBudget = 32
     espStats.tanks = 0
     local vehicles = workspace:FindFirstChild("SpawnedVehicles")
-    if Settings.EnemyTankESP and vehicles and lp.Team and lp.Team.Name ~= "Neutral" then
+    if Settings.EnemyTankESP and vehicles then
         local candidates = {}
-        local myColor = lp.TeamColor.Name
+        local myColor = lp.Team and lp.TeamColor.Name
         for _, veh in ipairs(vehicles:GetChildren()) do
             local enemyTeam = veh:GetAttribute("Team")
             local class = veh:GetAttribute("VehicleGeneralClass")
-            if veh:IsA("Model") and veh:GetAttribute("Type") == "Tank"
-                and enemyTeam and tostring(enemyTeam) ~= myColor
+            local kind = tostring(veh:GetAttribute("Type") or ""):lower()
+            local helicopter = kind == "helicopter" or kind == "heli"
+                or tostring(veh:GetAttribute("VehicleClass") or ""):lower():find("helicopter", 1, true) ~= nil
+            local teamAllowed = not Settings.TankTeamCheck or (myColor and lp.Team.Name ~= "Neutral"
+                and enemyTeam and tostring(enemyTeam) ~= myColor)
+            if veh:IsA("Model") and (kind == "tank" or Settings.HelicopterESP and helicopter)
+                and teamAllowed and veh ~= getActiveTank()
+                and (not Settings.TankOccupiedOnly or veh:GetAttribute("Occupied") == true)
                 and class ~= "Transport" and not veh:GetAttribute("HeavyTransport") then
                 local root = veh.PrimaryPart
                 if root then
@@ -2046,27 +2100,142 @@ local function scanEnemyTanks(origin)
         table.sort(candidates, function(a, b) return a.distance < b.distance end)
         for i = 1, math.min(#candidates, 16) do
             local veh = candidates[i].vehicle
-            local highlight = tankHighlights[veh]
-            if not highlight then
-                highlight = Instance.new("Highlight")
+            local tag = tankHighlights[veh]
+            if not tag then
+                local highlight = Instance.new("Highlight")
                 highlight.Name = "AutoLeadEnemyTank"
                 highlight.Adornee = veh
                 highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
                 highlight.FillTransparency = 0.94
                 highlight.OutlineTransparency = 0.08
                 highlight.Parent = visualContainer
-                tankHighlights[veh] = highlight
+                local box = Instance.new("Frame")
+                box.Name = "TankBounds"
+                box.BackgroundTransparency = 1
+                box.BorderSizePixel = 0
+                box.Visible = false
+                box.Parent = screenGui
+                local stroke = Instance.new("UIStroke")
+                stroke.Thickness = 1
+                stroke.Parent = box
+                local label = Instance.new("TextLabel")
+                label.Name = "TankLabel"
+                label.BackgroundTransparency = 1
+                label.AnchorPoint = Vector2.new(0.5, 1)
+                label.TextSize = 12
+                label.Font = Enum.Font.GothamMedium
+                label.TextStrokeTransparency = 0.25
+                label.TextStrokeColor3 = Color3.new()
+                label.Size = UDim2.fromOffset(260, 42)
+                label.Parent = screenGui
+                tag = { highlight = highlight, box = box, stroke = stroke, label = label, modules = {} }
+                tankHighlights[veh] = tag
             end
-            highlight.FillColor = getESPColor()
-            highlight.OutlineColor = getESPColor()
+            tag.root = veh.PrimaryPart
+            local cf, size = veh:GetBoundingBox()
+            tag.bounds, tag.size = tag.root.CFrame:ToObjectSpace(cf), size
+            tag.name = tostring(veh:GetAttribute("VehicleDisplayName") or veh.Name)
+            tag.class = tostring(veh:GetAttribute("VehicleClass") or veh:GetAttribute("VehicleGeneralClass") or "Unknown")
+            tag.highlight.FillColor = getESPColor()
+            tag.highlight.OutlineColor = getESPColor()
+            -- Only geometry under verified DamageModules, never similarly named
+            -- ammo inventory values or engine RemoteEvents.
+            local keep = {}
+            local damage = veh:FindFirstChild("DamageModules")
+            if damage and candidates[i].distance <= Settings.ModuleDistance
+                and (Settings.ModuleOutline or Settings.ModuleFilled) then
+                local count = 0
+                for _, model in ipairs(damage:GetChildren()) do
+                    local name = model.Name:lower()
+                    local kind = name == "engine" and "engine" or (name:find("ammo", 1, true) and "ammo")
+                    if kind and (kind == "engine" and Settings.ModuleEngine or kind == "ammo" and Settings.ModuleAmmo) then
+                        local parts = model:IsA("BasePart") and {model} or model:QueryDescendants("BasePart")
+                        for _, part in ipairs(parts) do
+                            if count >= 8 or moduleBudget <= 0 then break end
+                            count = count + 1
+                            moduleBudget = moduleBudget - 1
+                            keep[part] = true
+                            local mark = tag.modules[part]
+                            if not mark then
+                                local fill = Instance.new("BoxHandleAdornment")
+                                fill.Adornee, fill.AlwaysOnTop, fill.ZIndex = part, true, 1
+                                fill.Parent = visualContainer
+                                local outline = Instance.new("SelectionBox")
+                                outline.Adornee, outline.LineThickness, outline.SurfaceTransparency = part, 0.025, 1
+                                outline.Parent = visualContainer
+                                mark = { fill = fill, outline = outline }
+                                tag.modules[part] = mark
+                            end
+                            mark.kind = kind
+                            mark.fill.Size = part.Size
+                        end
+                    end
+                end
+            end
+            for part, mark in pairs(tag.modules) do
+                if not keep[part] then mark.fill:Destroy(); mark.outline:Destroy(); tag.modules[part] = nil end
+            end
             seen[veh] = true
             espStats.tanks = espStats.tanks + 1
         end
     end
-    for veh, highlight in pairs(tankHighlights) do
+    for veh, tag in pairs(tankHighlights) do
         if not seen[veh] then
-            highlight:Destroy()
+            tag.highlight:Destroy()
+            tag.box:Destroy()
+            tag.label:Destroy()
+            for _, mark in pairs(tag.modules) do mark.fill:Destroy(); mark.outline:Destroy() end
             tankHighlights[veh] = nil
+        end
+    end
+end
+
+-- Project only eight cached corners per tracked vehicle; no scene scans here.
+function espStats.drawTanks(camera)
+    local origin, viewport = camera.CFrame.Position, camera.ViewportSize
+    for veh, tag in pairs(tankHighlights) do
+        local live = Settings.EnemyTankESP and tag.root and tag.root.Parent and veh.Parent
+        local distance = live and (tag.root.Position - origin).Magnitude or math.huge
+        local visible = live and distance <= Settings.ESPMaxDistance
+        local fade = Settings.TankDistanceFade and math.clamp(1 - distance / math.max(1, Settings.ESPMaxDistance), 0, 1) or 1
+        tag.highlight.Enabled = visible == true
+        tag.highlight.FillTransparency = 1 - 0.06 * fade
+        tag.highlight.OutlineTransparency = 1 - 0.92 * fade
+        tag.box.Visible, tag.label.Visible = false, false
+        if visible and (Settings.TankBoxes or Settings.TankNames or Settings.TankClass or Settings.TankDistance) then
+            local cf = tag.root.CFrame * tag.bounds
+            local lo, hi, clipped = Vector2.new(math.huge, math.huge), Vector2.new(-math.huge, -math.huge), false
+            for x = -1, 1, 2 do for y = -1, 1, 2 do for z = -1, 1, 2 do
+                local p = camera:WorldToViewportPoint(cf:PointToWorldSpace(tag.size * Vector3.new(x, y, z) * 0.5))
+                if p.Z <= 0.1 then clipped = true else
+                    lo = Vector2.new(math.min(lo.X, p.X), math.min(lo.Y, p.Y))
+                    hi = Vector2.new(math.max(hi.X, p.X), math.max(hi.Y, p.Y))
+                end
+            end end end
+            if not clipped and hi.X >= 0 and hi.Y >= 0 and lo.X <= viewport.X and lo.Y <= viewport.Y then
+                local color = getESPColor()
+                tag.box.Position, tag.box.Size = UDim2.fromOffset(lo.X, lo.Y), UDim2.fromOffset(hi.X - lo.X, hi.Y - lo.Y)
+                tag.box.Visible, tag.stroke.Color, tag.stroke.Transparency = Settings.TankBoxes, color, 1 - fade
+                local text = {}
+                if Settings.TankNames then text[#text+1] = tag.name end
+                if Settings.TankClass then text[#text+1] = tag.class end
+                if Settings.TankDistance then text[#text+1] = string.format("%.0f m", distance / 2.7777778) end
+                tag.label.Text = table.concat(text, " · ")
+                tag.label.Position = UDim2.fromOffset((lo.X + hi.X) * 0.5, math.max(42, lo.Y - 3))
+                tag.label.TextColor3, tag.label.TextTransparency = color, 1 - fade
+                tag.label.TextStrokeTransparency = 1 - 0.75 * fade
+                tag.label.Visible = #text > 0
+            end
+        end
+        for part, mark in pairs(tag.modules) do
+            local show = visible and part.Parent ~= nil and distance <= Settings.ModuleDistance
+                and (mark.kind == "engine" and Settings.ModuleEngine or mark.kind == "ammo" and Settings.ModuleAmmo)
+            local color = mark.kind == "engine" and Settings.ModuleEngineColor or Settings.ModuleAmmoColor
+            mark.fill.Visible = show == true and Settings.ModuleFilled
+            mark.outline.Visible = show == true and Settings.ModuleOutline
+            mark.fill.Color3, mark.outline.Color3 = color, color
+            mark.fill.Transparency = 1 - 0.24 * fade
+            mark.outline.Transparency = 1 - fade
         end
     end
 end
@@ -2160,6 +2329,7 @@ RunService:BindToRenderStep("AttributePlayerESP", FREECAM_PRIORITY + 4, function
         scanEnemyPlayers(origin)
     end
     updatePlayerDrawings(camera)
+    espStats.drawTanks(camera)
     if now - lastTankScan >= 0.75 then
         lastTankScan = now
         scanEnemyTanks(origin)
@@ -2403,20 +2573,6 @@ function shotTracker.discover(entry)
     return true
 end
 
-shotTracker.hud = Instance.new("TextLabel")
-shotTracker.hud.Name = "ShotStatus"
-shotTracker.hud.AnchorPoint = Vector2.new(0, 1)
-shotTracker.hud.Position = UDim2.new(0, 14, 1, -70)
-shotTracker.hud.Size = UDim2.fromOffset(360, 62)
-shotTracker.hud.BackgroundColor3 = THEME.Background
-shotTracker.hud.BackgroundTransparency = 0.25
-shotTracker.hud.BorderSizePixel = 0
-shotTracker.hud.TextColor3 = THEME.TextPrimary
-shotTracker.hud.TextSize = 13
-shotTracker.hud.Font = Enum.Font.GothamMedium
-shotTracker.hud.TextWrapped = true
-shotTracker.hud.Parent = screenGui
-stylePanel(shotTracker.hud)
 do
     local notify = lp.PlayerGui:FindFirstChild("Notify")
     local event = notify and notify:FindFirstChild("Notification")
@@ -2671,14 +2827,8 @@ RunService:BindToRenderStep("AutoLeadShotTracking", FREECAM_PRIORITY + 3, functi
     if shotTracker.requested and now - shotTracker.requested > 1.25 then
         shotTracker.reject(aimCache.reason ~= "ready" and aimCache.reason or "No shot event received from weapon")
     end
-    local text = shotTracker.message .. "\n" .. shotTracker.detail
-    if latest then
-        text = text .. "\n" .. string.format("%s  ·  flight %.1fs  ·  %.0f%%",
-            latest.status, latest.elapsed or 0, (latest.progress or 0) * 100)
-    end
-    shotTracker.hud.Visible = Settings.ShotStatus and (#shotTracker.entries > 0
-        or shotTracker.requested ~= nil or now - (shotTracker.messageAt or 0) < 2)
-    if shotTracker.hud.Text ~= text then shotTracker.hud.Text = text end
+    -- Flight ETA stays at the target. Dispatch notifications use VibeUI,
+    -- rather than another persistent shot-status panel over the scene.
 end)
 local fireReadiness = { time = 0 }
 
@@ -3047,9 +3197,109 @@ function extras.updateTuning()
         end
     end
 end
+extras.foliage = { roots = {}, changed = setmetatable({}, { __mode = "k" }), queue = {}, head = 1 }
+function extras.foliage.kind(part, root)
+    local node = part
+    while node and node ~= root do
+        local name = node.Name:lower():gsub("[%s_%-]", "")
+        if name:match("^grass") or name:match("^tallgrass") then return "grass" end
+        if name:match("^pine") or name:match("^tree") or name:match("^oak")
+            or name:match("^birch") or name:match("^palm") then return "tree" end
+        node = node.Parent
+    end
+end
+function extras.foliage.restore()
+    local f = extras.foliage
+    for part, old in pairs(f.changed) do
+        pcall(function()
+            if part.LocalTransparencyModifier == 1 then part.LocalTransparencyModifier = old end
+        end)
+    end
+    table.clear(f.changed)
+    table.clear(f.queue)
+    f.head = 1
+end
+function extras.foliage.decoration(disabled)
+    local f = extras.foliage
+    if f.grass == disabled then return end
+    f.grass = disabled
+    local terrain = workspace:FindFirstChildOfClass("Terrain")
+    if not terrain then return end
+    local ok, err = pcall(function()
+        local read, old = pcall(function() return terrain.Decoration end)
+        if not read and gethiddenproperty then old = gethiddenproperty(terrain, "Decoration"); read = true end
+        assert(read, "Terrain decoration is unavailable")
+        if disabled then f.decorationOriginal = old end
+        local target = f.decorationOriginal
+        if disabled then target = false end
+        if target == nil or (not disabled and old ~= false) then return end
+        local wrote = pcall(function() terrain.Decoration = target end)
+        if not wrote then
+            assert(sethiddenproperty, "Terrain decoration cannot be changed by this client")
+            sethiddenproperty(terrain, "Decoration", target)
+        end
+    end)
+    if not ok then f.error = tostring(err); extras.notify("No Grass: terrain decoration unavailable; mesh grass still supported.") end
+end
+function extras.foliage.update()
+    local f = extras.foliage
+    f.decoration(Settings.NoGrass)
+    local mode = tostring(Settings.NoGrass) .. tostring(Settings.NoTrees)
+    if f.mode ~= mode then
+        f.mode = mode
+        f.restore()
+        for root, conn in pairs(f.roots) do conn:Disconnect(); f.roots[root] = nil end
+    end
+    if not Settings.NoGrass and not Settings.NoTrees then return end
+    local roots = {}
+    local map = workspace:FindFirstChild("Map")
+    local parts = map and map:FindFirstChild("MapParts")
+    if parts then roots[parts] = true end
+    for _, child in ipairs(workspace:GetChildren()) do
+        if child.Name == "Destructibles" or child.Name == "BillboardLods" then roots[child] = true end
+    end
+    for root, conn in pairs(f.roots) do
+        if not roots[root] then conn:Disconnect(); f.roots[root] = nil end
+    end
+    for root in pairs(roots) do
+        if not f.roots[root] then
+            f.roots[root] = root.DescendantAdded:Connect(function(part)
+                if part:IsA("BasePart") then f.queue[#f.queue+1] = {part, root} end
+            end)
+            for _, part in ipairs(root:QueryDescendants("BasePart")) do f.queue[#f.queue+1] = {part, root} end
+        end
+    end
+    for _ = 1, 300 do
+        local item = f.queue[f.head]
+        if not item then table.clear(f.queue); f.head = 1; break end
+        f.head = f.head + 1
+        local part, root = item[1], item[2]
+        if part.Parent and part:IsDescendantOf(root) then
+            local kind = f.kind(part, root)
+            if kind == "tree" and Settings.NoTrees or kind == "grass" and Settings.NoGrass then
+                if f.changed[part] == nil then f.changed[part] = part.LocalTransparencyModifier end
+                part.LocalTransparencyModifier = 1
+            end
+        end
+    end
+end
+function extras.flushShots()
+    if not Settings.ShotStatus then extras.shotCount = 0; return end
+    if (extras.shotCount or 0) == 0 or os.clock() < (extras.nextShotToast or 0) then return end
+    local count = extras.shotCount
+    extras.shotCount, extras.nextShotToast = 0, os.clock() + 1
+    extras.notify(count == 1 and "Shell fired · local dispatch confirmed"
+        or string.format("%d shells fired · local dispatches confirmed", count))
+end
 extras.tick = RunService.Heartbeat:Connect(function()
     if not extras.alive or os.clock() < (extras.nextTick or 0) then return end
     extras.nextTick = os.clock() + 0.25
+    extras.flushShots()
+    local foliageOK, foliageError = pcall(extras.foliage.update)
+    if not foliageOK and extras.foliage.error ~= tostring(foliageError) then
+        extras.foliage.error = tostring(foliageError)
+        extras.notify("Foliage update unavailable: " .. tostring(foliageError))
+    end
     local enabled = (Settings.StaffNotifications and "staff" or "") .. (Settings.CreatorNotifications and "creator" or "")
     if enabled ~= extras.roleMode then
         extras.roleMode = enabled
@@ -3112,6 +3362,7 @@ local function hookSingleWeaponModule(wm)
         local results = table.pack(oldFB(self, bulletData, ...))
         if ownShot and bulletData.id and bulletData.effectfired then
             shotTracker.serial = shotTracker.serial + 1
+            if Settings.ShotStatus then extras.shotCount = (extras.shotCount or 0) + 1 end
             shotTracker.sent = os.clock()
             shotTracker.requested = nil
             if entry then
@@ -3376,6 +3627,8 @@ _G.AutoLeadAssistDiagnostics = function()
             backend = playerEsp and "esp-lib.lua" or "unavailable", error = espStats.error,
             playerEnabled = Settings.PlayerESP, tankEnabled = Settings.EnemyTankESP,
             boxesEnabled = Settings.ESPBoxes },
+        foliage = { noGrass = Settings.NoGrass, noTrees = Settings.NoTrees,
+            error = extras.foliage.error, pending = math.max(0, #extras.foliage.queue - extras.foliage.head + 1) },
         armor = { enabled = Settings.ZeroEnemyArmor, vehicles = armorStats.vehicles,
             values = armorStats.values, clientSideOnly = true },
         zoom = { enabled = Settings.Zoom, fov = Settings.ZoomFOV },
@@ -3536,6 +3789,9 @@ end)
 _G.AutoLeadAssistUnload = function()
     extras.alive = false
     extras.tick:Disconnect()
+    for _, conn in pairs(extras.foliage.roots) do conn:Disconnect() end
+    extras.foliage.restore()
+    extras.foliage.decoration(false)
     extras.joined:Disconnect()
     extras.left:Disconnect()
     extras.restoreEdits()
