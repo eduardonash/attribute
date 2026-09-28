@@ -112,6 +112,7 @@ local Settings = {
     ESPMaxDistance = math.clamp(tonumber(rememberedSettings.ESPMaxDistance) or 4400, 0, 50000),
     AimSource = "Mouse",
     Freecam = false,
+    FreecamClickTP = false, -- Always opt in after loading; never teleport a seated character.
     DisableFiringShake = rememberedSettings.DisableFiringShake ~= false,
     DisableExplosionShake = rememberedSettings.DisableExplosionShake ~= false,
     FreecamSpeed = math.clamp(tonumber(rememberedSettings.FreecamSpeed) or 3.5, 0.5, 20),
@@ -206,6 +207,68 @@ function firingShake.setExplosions(enabled)
     end
 end
 firingShake.setExplosions(Settings.DisableExplosionShake)
+
+-- The active visualizer applies spring rotation after source-level effects.
+-- With both categories disabled, also neutralize delayed/uncategorized impulses
+-- at this one presentation callback. Never freeze the camera or disable input.
+function firingShake.restoreSink()
+    local sink = firingShake.sink
+    if sink then
+        sink.enabled = false
+        if sink.owner.RSFunction == sink.callback then sink.owner.RSFunction = sink.original end
+    end
+    firingShake.sink = nil
+end
+function firingShake.attachSink(owner)
+    firingShake.restoreSink()
+    local sink = { owner = owner, original = owner.RSFunction, enabled = true }
+    sink.callback = function(offset)
+        if sink.enabled and Settings.DisableFiringShake and Settings.DisableExplosionShake then
+            local ok, err = pcall(function()
+                owner.mainSpring.Target = Vector3.zero
+                owner.mainSpring.Position = Vector3.zero
+                owner.mainSpring.Velocity = Vector3.zero
+            end)
+            if not ok then
+                firingShake.sinkError = tostring(err)
+                sink.enabled = false -- Fail once, not every render frame.
+            else
+                offset = Vector3.zero
+            end
+        end
+        return sink.original(offset)
+    end
+    owner.RSFunction = sink.callback
+    firingShake.sink = sink
+end
+function firingShake.refreshSink()
+    if os.clock() < (firingShake.nextCheck or 0) then return end
+    firingShake.nextCheck = os.clock() + 2
+    if not (Settings.DisableFiringShake and Settings.DisableExplosionShake) then return end
+    local scripts = lp:FindFirstChild("PlayerScripts")
+    local visualizer = scripts and scripts:FindFirstChild("ClientVisualizer")
+    if firingShake.sink and firingShake.visualizer == visualizer then return end
+    if not visualizer or not getconnections or not debug.getupvalues then return end
+    local event = visualizer:FindFirstChild("shake")
+    if not event or not event:IsA("BindableEvent") then return end
+    local ok, err = pcall(function()
+        local module = require(ReplicatedStorage.TankModules.vfxHandler)
+        for _, connection in ipairs(getconnections(event.Event)) do
+            if connection.Function then
+                for _, value in pairs(debug.getupvalues(connection.Function)) do
+                    if type(value) == "table" and getmetatable(value) == module.camShaker
+                        and type(rawget(value, "RSFunction")) == "function"
+                        and type(rawget(value, "mainSpring")) == "table" then
+                        firingShake.attachSink(value)
+                        firingShake.visualizer = visualizer
+                        return
+                    end
+                end
+            end
+        end
+    end)
+    if not ok then firingShake.sinkError = tostring(err) end
+end
 
 local ESP_COLORS = {
     { name = "RED", color = Color3.fromRGB(255, 90, 125) },
@@ -574,6 +637,8 @@ do
 
             local freecamTab = window:Tab({ Name = "Freecam", Columns = 2 })
             local freecamControls = freecamTab:Section({ Name = "Camera", Side = 1 })
+            settingToggle(freecamControls, "Click Teleport (on foot)", "FreecamClickTP",
+                "Off on load. In freecam, Alt + left-click visible ground to move your character. Never moves vehicles; server may reject movement.")
             freecamControls:Toggle({
                 Name = "Disable Explosion Shake",
                 Flag = "ALA_DisableExplosionShake",
@@ -722,7 +787,7 @@ do
             tuning:Slider({ Name = "Turret Rotate Speed Slider", Min = 0.25, Max = 3,
                 Default = Settings.TurretSpeedMultiplier, Decimals = 2, Suffix = "x",
                 Callback = function(v) Settings.TurretSpeedMultiplier = math.clamp(tonumber(v) or 1, 0.25, 3) end })
-            settingToggle(tuning, "Tank Rapid Fire", "TankRapidFire", "Shortens supported RPM-based local intervals; release/repress fire after changing. Server reload rules still apply.")
+            settingToggle(tuning, "Tank Rapid Fire", "TankRapidFire", "Hold left-click or F to repeat while seated. Release to stop. Server ammo/reload rules still apply.")
             tuning:Slider({ Name = "Rapid Fire Multiplier", Min = 1, Max = 5,
                 Default = Settings.RapidFireMultiplier, Decimals = 1, Suffix = "x",
                 Callback = function(v) Settings.RapidFireMultiplier = math.clamp(tonumber(v) or 2, 1, 5) end })
@@ -3133,6 +3198,23 @@ function ammoReconcile.finish(snapshot, ammo)
     end)
 end
 
+-- One hold session, shared by native gunner clicks and direct repeat requests.
+local heldFire = { inputs = {}, nextAttempt = 0, nextAllowed = 0 }
+function heldFire.stop()
+    table.clear(heldFire.inputs)
+    heldFire.vehicle, heldFire.weapon, heldFire.seat = nil, nil, nil
+end
+function heldFire.interval()
+    local w = heldFire.data
+    local delay = w and w.shellData and tonumber(w.shellData.RPM) or 0.1
+    local count = w and w.shellData and tonumber(w.shellData.MuzzleCount) or 1
+    return math.max(0.1, delay / math.max(1, count))
+end
+function heldFire.matches(vehicle, weapon)
+    return Settings.TankRapidFire and next(heldFire.inputs) ~= nil
+        and heldFire.vehicle == vehicle and heldFire.weapon == weapon
+end
+
 local function installHooks()
     -- 1. Hook WeaponModule from ClientHandler environment
     pcall(function()
@@ -3153,6 +3235,9 @@ local function installHooks()
             hookedWeaponHandler = wh
 
             wh.fireWeapon = function(p56, p57, u58, p59, p60, p61, p62, p63)
+                local held = heldFire.matches(p59, u58)
+                if held and (heldFire.busy or os.clock() < heldFire.nextAllowed) then return false end
+                if held then heldFire.busy = true end
                 shotTracker.request("Weapon handler")
                 local before = shotTracker.serial
                 if p56 then
@@ -3170,7 +3255,15 @@ local function installHooks()
                     local ok, snapshot = pcall(ammoReconcile.capture, debug.info(2, "f"), u58, p59)
                     if ok then ammoSnapshot = snapshot else ammoReconcile.error = tostring(snapshot) end
                 end
-                local results = table.pack(oldFireWeapon(p56, p57, u58, p59, reloadAfterShot, p61, p62, p63))
+                local call = table.pack(pcall(oldFireWeapon, p56, p57, u58, p59, reloadAfterShot, p61, p62, p63))
+                if held then
+                    heldFire.busy = false
+                    if shotTracker.serial > before then
+                        heldFire.nextAllowed = os.clock() + heldFire.interval()
+                    end
+                end
+                if not call[1] then error(call[2], 0) end
+                local results = table.pack(table.unpack(call, 2, call.n))
                 if results[1] == true and shotTracker.serial > before then
                     ammoReconcile.finish(ammoSnapshot, results[2])
                 end
@@ -3263,6 +3356,8 @@ _G.AutoLeadAssistDiagnostics = function()
         weapon = weapon and weapon.weaponName or "none",
         loaded = weapon and weapon.loaded or "none",
         freecam = freecamActive,
+        clickTeleport = Settings.FreecamClickTP,
+        heldFire = { active = next(heldFire.inputs) ~= nil, busy = heldFire.busy == true },
         autoLead = Settings.AutoLead,
         autoBallistic = Settings.AutoBallistic,
         infiniteAmmo = Settings.InfiniteAmmo,
@@ -3288,6 +3383,9 @@ _G.AutoLeadAssistDiagnostics = function()
             error = firingShake.error },
         explosionShake = { enabled = Settings.DisableExplosionShake,
             active = firingShake.explosions ~= nil, error = firingShake.explosionError },
+        cameraShakeSink = { active = firingShake.sink ~= nil and firingShake.sink.enabled == true
+                and Settings.DisableFiringShake and Settings.DisableExplosionShake,
+            error = firingShake.sinkError },
         shotTracking = { message = shotTracker.message, detail = shotTracker.detail,
             active = #shotTracker.entries, dispatched = shotTracker.serial,
             observed = shotTracker.observed, rejected = shotTracker.rejected, scanMs = shotTracker.lastScanMs,
@@ -3324,13 +3422,68 @@ _G.AutoLeadAssistSetZoom = function(enabled)
     if zoomToggleHandle then pcall(function() zoomToggleHandle:Set(Settings.Zoom) end) end
 end
 
--- F works in either view. Driver-seat left-click also uses the direct-fire
--- path, while gunner-seat left-click remains native to avoid duplicate shots.
+-- Actual surface hits only: no horizon-plane fallback and no vehicle movement.
+function heldFire.clickTeleport()
+    if not Settings.FreecamClickTP or not Settings.Freecam or not freecamActive then return end
+    local character = lp.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if not humanoid or humanoid.Health <= 0 or humanoid.SeatPart or humanoid.Sit or not root then
+        setFreecamHint("Click teleport requires being on foot")
+        return
+    end
+    local camera = workspace.CurrentCamera
+    if not camera or os.clock() < (heldFire.nextTeleport or 0) then return end
+    heldFire.nextTeleport = os.clock() + 0.5
+    local mouse = UserInputService:GetMouseLocation()
+    local ray = camera:ViewportPointToRay(mouse.X, mouse.Y)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { character, visualContainer }
+    params.RespectCanCollide = true
+    local hit = workspace:Raycast(ray.Origin, ray.Direction * 15000, params)
+    if not hit or hit.Normal.Y < 0.5 then
+        setFreecamHint("Click visible ground, not a wall or sky")
+        return
+    end
+    -- R6 HipHeight is zero; its leg height must also clear the ground.
+    local leg = character:FindFirstChild("Left Leg")
+    local height = humanoid.HipHeight + root.Size.Y * 0.5
+        + (humanoid.RigType == Enum.HumanoidRigType.R6 and leg and leg.Size.Y or 0) + 0.5
+    local target = hit.Position + Vector3.yAxis * height
+    local clearance = workspace:Raycast(hit.Position + Vector3.yAxis * 0.1,
+        Vector3.yAxis * (height + root.Size.Y), params)
+    if clearance then setFreecamHint("Not enough headroom at that point"); return end
+    heldFire.stop()
+    character:PivotTo(CFrame.new(target - root.Position) * character:GetPivot())
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.AssemblyAngularVelocity = Vector3.zero
+    setFreecamHint("Character moved; freecam stays in place")
+end
+
+-- A gunner's first mouse click stays native. Subsequent held requests share
+-- the handler cooldown, so automatic native weapons do not get a second stream.
 local lastDirectFireTime = 0
 local freecamFireConn = UserInputService.InputBegan:Connect(function(input, gpe)
     if gpe or UserInputService:GetFocusedTextBox() then return end
+    if input.UserInputType == Enum.UserInputType.MouseButton1 and Settings.FreecamClickTP
+        and Settings.Freecam and freecamActive
+        and (UserInputService:IsKeyDown(Enum.KeyCode.LeftAlt) or UserInputService:IsKeyDown(Enum.KeyCode.RightAlt)) then
+        heldFire.clickTeleport()
+        return
+    end
     if input.UserInputType == Enum.UserInputType.MouseButton1 or input.KeyCode == Enum.KeyCode.F then
         shotTracker.request("Input received")
+        if Settings.TankRapidFire then
+            local vehicle = getActiveTank()
+            local w = vehicle and getActiveWeaponData(vehicle)
+            local hum = lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
+            if w and hum and hum.Health > 0 and hum.SeatPart then
+                heldFire.vehicle, heldFire.weapon, heldFire.data, heldFire.seat = vehicle, w.weapon, w, hum.SeatPart
+                heldFire.inputs[input.UserInputType == Enum.UserInputType.MouseButton1 and "mouse" or "key"] = true
+                heldFire.nextAttempt = os.clock() + heldFire.interval()
+            end
+        end
     end
     local wantsDirectFire = input.KeyCode == Enum.KeyCode.F
     if input.UserInputType == Enum.UserInputType.MouseButton1 then
@@ -3351,6 +3504,29 @@ local freecamFireConn = UserInputService.InputBegan:Connect(function(input, gpe)
             if not fired then shotTracker.reject(reason) end
         end
     end
+end)
+heldFire.ended = UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then heldFire.inputs.mouse = nil end
+    if input.KeyCode == Enum.KeyCode.F then heldFire.inputs.key = nil end
+    if next(heldFire.inputs) == nil then heldFire.stop() end
+end)
+heldFire.focus = UserInputService.WindowFocusReleased:Connect(heldFire.stop)
+heldFire.tick = RunService.Heartbeat:Connect(function()
+    firingShake.refreshSink()
+    if next(heldFire.inputs) == nil then return end
+    local hum = lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
+    local vehicle = getActiveTank()
+    local w = vehicle and getActiveWeaponData(vehicle)
+    if not Settings.TankRapidFire or UserInputService:GetFocusedTextBox() or not hum or hum.Health <= 0
+        or not hum.SeatPart or hum.SeatPart ~= heldFire.seat or vehicle ~= heldFire.vehicle
+        or not w or w.weapon ~= heldFire.weapon then heldFire.stop(); return end
+    heldFire.data = w
+    local now = os.clock()
+    if heldFire.busy or now < heldFire.nextAttempt or now < heldFire.nextAllowed then return end
+    heldFire.nextAttempt = now + heldFire.interval()
+    local ok, fired, reason = pcall(triggerDirectFire)
+    if not ok then heldFire.stop(); shotTracker.reject(tostring(fired))
+    elseif not fired then shotTracker.reject(reason) end
 end)
 
 -- ===================================================================
@@ -3382,6 +3558,10 @@ _G.AutoLeadAssistUnload = function()
     RunService:UnbindFromRenderStep("AttributePlayerESP")
     if playerEsp then playerEsp.unload() end
     if freecamFireConn then freecamFireConn:Disconnect() end
+    heldFire.stop()
+    heldFire.ended:Disconnect()
+    heldFire.focus:Disconnect()
+    heldFire.tick:Disconnect()
     setZoom(false)
     for _, connection in pairs(armorVehicleWatchers) do connection:Disconnect() end
     for value, original in pairs(originalEnemyArmor) do
@@ -3402,6 +3582,7 @@ _G.AutoLeadAssistUnload = function()
     setFreecam(false)
     firingShake.restore()
     firingShake.restoreExplosions()
+    firingShake.restoreSink()
     _G.AutoLeadAssistDiagnostics = nil
     _G.AutoLeadAssistSetFreecam = nil
     _G.AutoLeadAssistSetZoom = nil
