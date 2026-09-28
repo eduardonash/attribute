@@ -21,7 +21,7 @@ local camera = workspace.CurrentCamera
 
 -- The settings menu belongs to VibeUI; this ScreenGui only owns the small
 -- bottom-left impact readout. Clear overlays from older script versions too.
-for _, guiName in ipairs({ "AutoLeadSettingsUI", "AutoLeadOverlay" }) do
+for _, guiName in ipairs({ "AutoLeadSettingsUI", "AutoLeadOverlay", "AttributeTankOverlay" }) do
     local prev = lp:WaitForChild("PlayerGui"):FindFirstChild(guiName)
     if prev then prev:Destroy() end
     local prevCg = game:GetService("CoreGui"):FindFirstChild(guiName)
@@ -1974,6 +1974,73 @@ end)
 local playerDrawings = {}
 local tankHighlights = {}
 local espStats = { players = 0, tanks = 0 }
+-- WorldToViewportPoint pixels must not receive the top-bar/safe-area inset.
+-- Keep this separate so the existing impact HUD layout is unchanged.
+espStats.gui = Instance.new("ScreenGui")
+espStats.gui.Name = "AttributeTankOverlay"
+espStats.gui.IgnoreGuiInset = true
+espStats.gui.ResetOnSpawn = false
+espStats.gui.DisplayOrder = screenGui.DisplayOrder
+espStats.gui.Parent = lp:WaitForChild("PlayerGui")
+espStats.edges = {{1,2},{1,3},{1,5},{2,4},{2,6},{3,4},{3,7},{4,8},{5,6},{5,7},{6,8},{7,8}}
+function espStats.newOutline()
+    local group = Instance.new("Folder")
+    group.Name = "ModuleOutline"
+    group.Parent = espStats.gui
+    local lines = {}
+    for i = 1, 12 do
+        local line = Instance.new("Frame")
+        line.Name = "Edge"
+        line.AnchorPoint = Vector2.new(0.5, 0.5)
+        line.BorderSizePixel = 1
+        line.BorderColor3 = Color3.fromRGB(12, 14, 18)
+        line.Visible = false
+        line.Parent = group
+        lines[i] = line
+    end
+    return group, lines
+end
+function espStats.drawOutline(mark, part, camera, color, enabled)
+    local points = mark.points
+    if enabled then
+        local i = 0
+        for x = -1, 1, 2 do for y = -1, 1, 2 do for z = -1, 1, 2 do
+            i = i + 1
+            points[i] = camera:WorldToViewportPoint(part.CFrame:PointToWorldSpace(part.Size * Vector3.new(x,y,z) * 0.5))
+        end end end
+    end
+    for i, edge in ipairs(espStats.edges) do
+        local line = mark.lines[i]
+        line.Visible = false
+        if enabled then
+            local a, b = points[edge[1]], points[edge[2]]
+            if a.Z > 0.1 and b.Z > 0.1 then
+                local start, delta = Vector2.new(a.X,a.Y), Vector2.new(b.X-a.X,b.Y-a.Y)
+                local low, high = 0, 1
+                local function clip(p, q)
+                    if math.abs(p) < 1e-8 then return q >= 0 end
+                    local t = q / p
+                    if p < 0 then low = math.max(low,t) else high = math.min(high,t) end
+                    return low <= high
+                end
+                local view = camera.ViewportSize
+                if clip(-delta.X,start.X) and clip(delta.X,view.X-start.X)
+                    and clip(-delta.Y,start.Y) and clip(delta.Y,view.Y-start.Y) then
+                    local first, last = start + delta * low, start + delta * high
+                    local d = last - first
+                    if d.Magnitude >= 0.5 then
+                        line.Position = UDim2.fromOffset((first.X+last.X)*0.5,(first.Y+last.Y)*0.5)
+                        line.Size = UDim2.fromOffset(d.Magnitude,2)
+                        line.Rotation = math.deg(math.atan2(d.Y,d.X))
+                        line.BackgroundColor3 = color
+                        line.BackgroundTransparency = 0
+                        line.Visible = true
+                    end
+                end
+            end
+        end
+    end
+end
 local playerEsp
 local drawingAvailable = Drawing and type(Drawing.new) == "function"
 if drawingAvailable then
@@ -2114,7 +2181,7 @@ local function scanEnemyTanks(origin)
                 box.BackgroundTransparency = 1
                 box.BorderSizePixel = 0
                 box.Visible = false
-                box.Parent = screenGui
+                box.Parent = espStats.gui
                 local stroke = Instance.new("UIStroke")
                 stroke.Thickness = 1
                 stroke.Parent = box
@@ -2127,7 +2194,7 @@ local function scanEnemyTanks(origin)
                 label.TextStrokeTransparency = 0.25
                 label.TextStrokeColor3 = Color3.new()
                 label.Size = UDim2.fromOffset(260, 42)
-                label.Parent = screenGui
+                label.Parent = espStats.gui
                 tag = { highlight = highlight, box = box, stroke = stroke, label = label, modules = {} }
                 tankHighlights[veh] = tag
             end
@@ -2160,10 +2227,8 @@ local function scanEnemyTanks(origin)
                                 local fill = Instance.new("BoxHandleAdornment")
                                 fill.Adornee, fill.AlwaysOnTop, fill.ZIndex = part, true, 1
                                 fill.Parent = visualContainer
-                                local outline = Instance.new("SelectionBox")
-                                outline.Adornee, outline.LineThickness, outline.SurfaceTransparency = part, 0.025, 1
-                                outline.Parent = visualContainer
-                                mark = { fill = fill, outline = outline }
+                                local outline, lines = espStats.newOutline()
+                                mark = { fill = fill, outline = outline, lines = lines, points = {} }
                                 tag.modules[part] = mark
                             end
                             mark.kind = kind
@@ -2232,10 +2297,11 @@ function espStats.drawTanks(camera)
                 and (mark.kind == "engine" and Settings.ModuleEngine or mark.kind == "ammo" and Settings.ModuleAmmo)
             local color = mark.kind == "engine" and Settings.ModuleEngineColor or Settings.ModuleAmmoColor
             mark.fill.Visible = show == true and Settings.ModuleFilled
-            mark.outline.Visible = show == true and Settings.ModuleOutline
-            mark.fill.Color3, mark.outline.Color3 = color, color
+            espStats.drawOutline(mark, part, camera, color, show == true and Settings.ModuleOutline)
+            mark.fill.Color3 = color
             mark.fill.Transparency = 1 - 0.24 * fade
-            mark.outline.Transparency = 1 - fade
+            -- Module edges remain opaque within range; tank distance fading
+            -- must not make the outline-only inspection mode unreadable.
         end
     end
 end
@@ -3806,6 +3872,7 @@ _G.AutoLeadAssistUnload = function()
     if uiInsertConn then uiInsertConn:Disconnect() end
     if vibeUi then pcall(function() vibeUi:Unload() end) end
     if screenGui then screenGui:Destroy() end
+    espStats.gui:Destroy()
     if visualContainer then visualContainer:Destroy() end
     for _, attachment in ipairs(beamAttachments) do attachment:Destroy() end
     for _, tag in pairs(playerDrawings) do removePlayerDrawing(tag) end

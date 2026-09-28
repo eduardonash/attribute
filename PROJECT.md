@@ -2,6 +2,12 @@
 
 ## 1. Overview
 
+### Tank alignment and outline-only correction (2026-09-27)
+
+Tank boxes/labels previously used viewport projection inside an inset-enabled ScreenGui, introducing a fixed downward screen offset that was especially obvious on small distant targets. They now use a dedicated `AttributeTankOverlay` with `IgnoreGuiInset = true`; the impact HUD layout is unchanged. Module outlines no longer use thin, depth-occluded world-space SelectionBoxes. They use 12 pooled screen-space box edges per module, with a 2-pixel colored core and 1-pixel dark border, visible through the hull independently of fill. Tank distance fading no longer fades module outlines. Edges track each part's current transform/size, clip to the viewport, and hide behind the near plane. Existing module/vehicle caps and cleanup remain in place.
+
+Full-source compilation and 23 isolated renderer assertions passed, including near/far projection, outline-only visibility, behind-camera/offscreen handling and object cleanup. Integrated box projection error stayed below one pixel (integer GUI rounding) at 20, 150 and 1,500 studs. Tests used temporary objects outside the live scene; the full script was not reloaded and live visual/FPS validation remains pending.
+
 ### Foliage, tank modules and shot notifications (2026-09-27)
 
 - **World → Foliage:** No Grass / No Trees default off. Terrain grass decoration and recognized grass/tree mesh visuals are hidden only locally. Tree recognition includes map-scoped Pine/Tree/Oak/Birch/Palm names and their LOD variants. Originals are restored on disable/unload without overwriting later transparency changes by other code. Existing geometry is queued once per toggle/root change; streamed parts use root-local events and batches of at most 300 parts per 0.25-second update. No geometry is destroyed and collisions/raycasts remain unchanged. Unknown foliage naming is not guessed; unsupported terrain-decoration access appears in diagnostics.
