@@ -1992,8 +1992,7 @@ function espStats.newOutline()
         local line = Instance.new("Frame")
         line.Name = "Edge"
         line.AnchorPoint = Vector2.new(0.5, 0.5)
-        line.BorderSizePixel = 1
-        line.BorderColor3 = Color3.fromRGB(12, 14, 18)
+        line.BorderSizePixel = 0
         line.Visible = false
         line.Parent = group
         lines[i] = line
@@ -2030,7 +2029,7 @@ function espStats.drawOutline(mark, part, camera, color, enabled)
                     local d = last - first
                     if d.Magnitude >= 0.5 then
                         line.Position = UDim2.fromOffset((first.X+last.X)*0.5,(first.Y+last.Y)*0.5)
-                        line.Size = UDim2.fromOffset(d.Magnitude,2)
+                        line.Size = UDim2.fromOffset(d.Magnitude,1)
                         line.Rotation = math.deg(math.atan2(d.Y,d.X))
                         line.BackgroundColor3 = color
                         line.BackgroundTransparency = 0
