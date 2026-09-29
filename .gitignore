@@ -7,3 +7,4 @@
 !/tests/
 /tests/*
 !/tests/adaptive-ballistics.spec.lua
+!/tests/shell-redirection.spec.lua

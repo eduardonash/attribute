@@ -98,6 +98,8 @@ local Settings = {
     ShotStatus = rememberedSettings.ShotStatus ~= false,
     Trajectory = true,
     AdaptiveAim = adaptiveAim == true,
+    ShellRedirection = rememberedSettings.ShellRedirection == true,
+    ShellFocusRadius = math.clamp(tonumber(rememberedSettings.ShellFocusRadius) or 60, 5, 250),
     ArtilleryAutoLay = rememberedSettings.ArtilleryAutoLay ~= false,
     InfiniteAmmo = rememberedSettings.InfiniteAmmo == true,
     TurretSpeedEnabled = rememberedSettings.TurretSpeedEnabled == true,
@@ -639,6 +641,13 @@ do
             settingToggle(aimAssist, "Freecam Artillery Auto-Elevation", "ArtilleryAutoLay",
                 "Align both axes only for a selected high-arc fallback. Direct shots keep normal tracking; some native modes require the gunner optic active.")
             local aimTarget = aimTab:Section({ Name = "Targeting", Side = 2 })
+            settingToggle(aimTarget, "Shell Redirection", "ShellRedirection",
+                "Experimental mid-air steering of your ordinary shells toward the visible enemy nearest the cursor. Requires projectile Actor access.")
+            aimTarget:Slider({
+                Name = "Player Focus Radius", Flag = "ALA_ShellFocusRadius",
+                Min = 5, Max = 250, Default = Settings.ShellFocusRadius, Decimals = 1, Suffix = " px",
+                Callback = function(value) Settings.ShellFocusRadius = math.clamp(value, 5, 250) end
+            })
             aimTarget:Dropdown({
                 Name = "Aim Source",
                 Flag = "ALA_AimSource",
@@ -1158,6 +1167,7 @@ end
 -- The target classes change much less often than the cursor. Cache only the
 -- raycast filters; the ray origin/direction and actual hit are still read every
 -- rendered frame so the preview does not lag behind mouse movement.
+local shellRedirection = { players = {}, candidates = {}, focused = nil }
 local aimIncludeParams = RaycastParams.new()
 aimIncludeParams.FilterType = Enum.RaycastFilterType.Include
 aimIncludeParams.IgnoreWater = true
@@ -1184,8 +1194,18 @@ local function refreshAimFilters(veh)
             if candidate ~= veh then targets[#targets + 1] = candidate end
         end
     end
+    table.clear(shellRedirection.players)
     for _, player in ipairs(Players:GetPlayers()) do
         if player ~= lp and player.Character then targets[#targets + 1] = player.Character end
+        local character = player ~= lp and player.Character
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        local part = character and (character:FindFirstChild("UpperTorso")
+            or character:FindFirstChild("Torso") or character:FindFirstChild("HumanoidRootPart"))
+        if humanoid and part and part:IsA("BasePart") then
+            shellRedirection.players[#shellRedirection.players + 1] = {
+                player = player, character = character, humanoid = humanoid, part = part
+            }
+        end
     end
     local spawnedPlayers = workspace:FindFirstChild("SpawnedPlayers")
     if spawnedPlayers then
@@ -1198,11 +1218,199 @@ local function refreshAimFilters(veh)
     aimWorldParams.FilterDescendantsInstances = { veh, lp.Character }
 end
 
+function shellRedirection.select(cam, pixel, origin)
+    shellRedirection.focused = nil
+    if not Settings.ShellRedirection or shellRedirection.failed then return end
+    local candidates = shellRedirection.candidates
+    table.clear(candidates)
+    local radiusSquared = Settings.ShellFocusRadius * Settings.ShellFocusRadius
+    for _, record in ipairs(shellRedirection.players) do
+        local player, part = record.player, record.part
+        -- Validate cached membership every frame; death/respawn cannot retain a focus.
+        if player.Parent == Players and player.Character == record.character
+            and part.Parent and record.humanoid.Health > 0
+            and not player.Neutral and player.Team ~= nil and player.Team ~= lp.Team then
+            local point, visible = cam:WorldToViewportPoint(part.Position)
+            local distance = (point.X-pixel.X)^2 + (point.Y-pixel.Y)^2
+            if visible and point.Z > 0 and distance <= radiusSquared then
+                -- Keep only the four nearest candidates, bounding visibility rays.
+                local index = 1
+                while candidates[index] and candidates[index].distance <= distance do index += 1 end
+                if index <= 4 then
+                    table.insert(candidates,index,{record=record,distance=distance})
+                    if #candidates > 4 then table.remove(candidates) end
+                end
+            end
+        end
+    end
+    for _, candidate in ipairs(candidates) do
+        local record = candidate.record
+        local hit = workspace:Raycast(origin,record.part.Position-origin,aimWorldParams)
+        if not hit or hit.Instance:IsDescendantOf(record.character) then
+            shellRedirection.focused = record.player
+            return record.part.Position, record.part.AssemblyLinearVelocity, record.part, Vector3.yAxis
+        end
+    end
+end
+
+-- Runs inside each native projectile Actor, where the real simulation tables live.
+-- The display Part is never used as a physics control surface.
+shellRedirection.steerSource = [=[
+local function steer(state, targetPosition, targetVelocity)
+    if type(state) ~= "table" or state.replicate ~= true or state.Behavior ~= "Default"
+        or state.destroy or state.hitray or state.physicalprojectile
+        or typeof(state.position) ~= "Vector3" or typeof(state.position0) ~= "Vector3"
+        or typeof(state.velocity) ~= "Vector3" then return false end
+    if (state.position-state.position0).Magnitude < 15 then return false end
+    local speed = state.velocity.Magnitude
+    if speed < 1 or typeof(targetPosition) ~= "Vector3" or typeof(targetVelocity) ~= "Vector3" then return false end
+    local offset = targetPosition-state.position
+    if offset.Magnitude < 1 then return false end
+    local time = math.min(offset.Magnitude/speed, 2)
+    local desired = offset + targetVelocity*time
+    if desired.Magnitude < 1 then return false end
+    -- Preserve instantaneous speed; native integration still handles gravity,
+    -- drag, ray collisions, lifetime and destruction on the following step.
+    state.velocity = desired.Unit*speed
+    return true
+end
+]=]
+shellRedirection.actorSource = [=[
+local actor = game:GetService("ReplicatedStorage").PHRST.Threads:FindFirstChild(@ACTOR@)
+local player = game:GetService("Players").LocalPlayer
+local owner = @OWNER@
+if not actor or not player or player:GetAttribute("AttributeShellRedirectOwner") ~= owner then return end
+local matches = filtergc("function", {Name="simulatebullet",IgnoreExecutor=false}, false)
+local original, env
+for _, fn in ipairs(matches or {}) do
+    local candidate = getfenv(fn)
+    if type(candidate)=="table" and candidate.simulatebullet==fn then
+        if original then return end
+        original,env = fn,candidate
+    end
+end
+if not original then return end
+@STEER@
+local oldStatus = actor:GetAttribute("AttributeShellRedirectStatus")
+local wrapper
+wrapper = function(state, ...)
+    local heartbeat = player:GetAttribute("AttributeShellRedirectHeartbeat")
+    if player:GetAttribute("AttributeShellRedirectOwner")==owner
+        and type(heartbeat)=="number" and os.clock()-heartbeat < 0.75 then
+        local position = player:GetAttribute("AttributeShellRedirectPosition")
+        local velocity = player:GetAttribute("AttributeShellRedirectVelocity")
+        local ok, err = pcall(steer,state,position,velocity)
+        if not ok then
+            actor:SetAttribute("AttributeShellRedirectStatus", owner.."|error: "..tostring(err))
+        end
+    end
+    return original(state, ...)
+end
+env.simulatebullet = wrapper
+actor:SetAttribute("AttributeShellRedirectStatus",owner)
+task.spawn(function()
+    while player.Parent and actor.Parent and env.simulatebullet==wrapper do
+        local heartbeat = player:GetAttribute("AttributeShellRedirectHeartbeat")
+        if player:GetAttribute("AttributeShellRedirectOwner")~=owner or type(heartbeat)~="number"
+            or os.clock()-heartbeat >= 0.75 then break end
+        task.wait(0.2)
+    end
+    if env.simulatebullet==wrapper then env.simulatebullet=original end
+    if actor.Parent then
+        local status = actor:GetAttribute("AttributeShellRedirectStatus")
+        if type(status)=="string" and status:sub(1,#owner)==owner then
+            actor:SetAttribute("AttributeShellRedirectStatus",oldStatus)
+        end
+    end
+end)
+]=]
+shellRedirection.attributes = {"AttributeShellRedirectOwner","AttributeShellRedirectHeartbeat",
+    "AttributeShellRedirectPosition","AttributeShellRedirectVelocity"}
+function shellRedirection.stop()
+    if shellRedirection.originalAttributes and lp:GetAttribute("AttributeShellRedirectOwner")==shellRedirection.owner then
+        for _, key in ipairs(shellRedirection.attributes) do
+            lp:SetAttribute(key,shellRedirection.originalAttributes[key])
+        end
+    end
+    shellRedirection.active, shellRedirection.focused = false,nil
+    shellRedirection.ready = 0
+    shellRedirection.originalAttributes = nil
+end
+function shellRedirection.update()
+    if not Settings.ShellRedirection then
+        if shellRedirection.active then shellRedirection.stop() end
+        shellRedirection.failed, shellRedirection.error = nil,nil
+        shellRedirection.reportedError = nil
+        return
+    end
+    local now = os.clock()
+    if not shellRedirection.active then
+        if shellRedirection.failed then return end
+        if type(getactors)~="function" or type(run_on_actor)~="function" then
+            shellRedirection.error = "Executor cannot access projectile Actors"
+            shellRedirection.failed = true
+            return
+        end
+        shellRedirection.originalAttributes = {}
+        for _,key in ipairs(shellRedirection.attributes) do shellRedirection.originalAttributes[key]=lp:GetAttribute(key) end
+        shellRedirection.owner = "Attribute:"..tostring(now)
+        lp:SetAttribute("AttributeShellRedirectOwner",shellRedirection.owner)
+        lp:SetAttribute("AttributeShellRedirectHeartbeat",now)
+        shellRedirection.active, shellRedirection.actors = true,{}
+        shellRedirection.installAt = now
+        local ok,err = pcall(function()
+            local phrst = ReplicatedStorage:FindFirstChild("PHRST")
+            local threads = phrst and phrst:FindFirstChild("Threads")
+            for _,actor in ipairs(getactors()) do
+                if threads and actor.Parent==threads and actor:IsA("Actor") and #shellRedirection.actors<8 then
+                    local code = shellRedirection.actorSource:gsub("@ACTOR@",function() return string.format("%q",actor.Name) end)
+                        :gsub("@OWNER@",function() return string.format("%q",shellRedirection.owner) end)
+                        :gsub("@STEER@",function() return shellRedirection.steerSource end)
+                    local installed = pcall(run_on_actor,actor,code)
+                    if installed then shellRedirection.actors[#shellRedirection.actors+1]=actor end
+                end
+            end
+        end)
+        if not ok or #shellRedirection.actors==0 then
+            shellRedirection.error = not ok and tostring(err) or "No accessible projectile Actor"
+            shellRedirection.failed = true
+            shellRedirection.stop()
+            return
+        end
+    end
+    if now-(shellRedirection.updated or 0)<0.05 then return end
+    shellRedirection.updated = now
+    local focused = shellRedirection.focused
+    local character = focused and focused.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    local part = character and (character:FindFirstChild("UpperTorso") or character:FindFirstChild("Torso")
+        or character:FindFirstChild("HumanoidRootPart"))
+    local valid = focused and focused.Parent==Players and humanoid and humanoid.Health>0 and part
+    lp:SetAttribute("AttributeShellRedirectPosition",valid and part.Position or nil)
+    lp:SetAttribute("AttributeShellRedirectVelocity",valid and part.AssemblyLinearVelocity or nil)
+    lp:SetAttribute("AttributeShellRedirectHeartbeat",now)
+    shellRedirection.ready = 0
+    for _,actor in ipairs(shellRedirection.actors) do
+        local status = actor:GetAttribute("AttributeShellRedirectStatus")
+        if status==shellRedirection.owner then
+            shellRedirection.ready+=1
+        elseif type(status)=="string" and status:sub(1,#shellRedirection.owner)==shellRedirection.owner then
+            shellRedirection.error = status
+        end
+    end
+    if shellRedirection.error or shellRedirection.ready==0 and now-shellRedirection.installAt>2 then
+        shellRedirection.error = shellRedirection.error or "Projectile Actors did not confirm steering access"
+        shellRedirection.failed = true
+        shellRedirection.stop()
+    end
+end
+
 -- Prefer vehicles/characters even behind scenery, then use the visible map
 -- point so shots at ground pixels have a finite ballistic target.
 local function getAimTarget(aimSource, veh)
     local cam = workspace.CurrentCamera
     local mouse = lp:GetMouse()
+    shellRedirection.focused = nil
     if not cam then return Vector3.new(0, 0, 0), Vector3.new(), nil, Vector3.new(0, 1, 0), Vector3.new(0, 0, -1) end
 
     -- Freecam left-click aims where the cursor points, regardless of the normal
@@ -1222,6 +1430,9 @@ local function getAimTarget(aimSource, veh)
         origin = cam.CFrame.Position
         direction = cam.CFrame.LookVector * 100000
     end
+
+    local focusPixel = aimSource == "Mouse" and UserInputService:GetMouseLocation() or cam.ViewportSize*0.5
+    shellRedirection.select(cam,focusPixel,origin)
 
     local ray = nil
     -- A freecam cursor selects the first visible world surface. The normal
@@ -3111,6 +3322,7 @@ refreshAimCache = function()
             aimCache.targetPos = nil
             aimCache.clearance = false
             aimCache.fireBlock = "No active weapon"
+            shellRedirection.focused = nil
             aimCache.waitForAlignment, aimCache.solutionBlocked = false, false
             aimCache.reason = "no active weapon"
             return
@@ -3174,6 +3386,16 @@ refreshAimCache = function()
         aimCache.previewDirection = nil
         aimCache.waitForAlignment, aimCache.solutionBlocked = false, false
         aimCache.reason = tostring(err)
+    end
+    local redirectOK,redirectError = pcall(shellRedirection.update)
+    if not redirectOK then
+        shellRedirection.error = tostring(redirectError)
+        shellRedirection.failed = true
+        pcall(shellRedirection.stop)
+    end
+    if shellRedirection.error and shellRedirection.error~=shellRedirection.reportedError then
+        shellRedirection.reportedError = shellRedirection.error
+        extras.notify("Shell Redirection unavailable: "..shellRedirection.error)
     end
     visualDiagnostics.aimMs = (os.clock() - now) * 1000
 end
@@ -3740,6 +3962,9 @@ _G.AutoLeadAssistDiagnostics = function()
         clickTeleport = Settings.FreecamClickTP,
         heldFire = { active = next(heldFire.inputs) ~= nil, busy = heldFire.busy == true },
         adaptiveAim = Settings.AdaptiveAim,
+        shellRedirection = { enabled = Settings.ShellRedirection, radiusPixels = Settings.ShellFocusRadius,
+            focusedPlayer = shellRedirection.focused and shellRedirection.focused.Name or nil,
+            readyActors = shellRedirection.ready or 0, error = shellRedirection.error },
         infiniteAmmo = Settings.InfiniteAmmo,
         vehicleExtras = { localEdits = #extras.edits, error = extras.tuningError,
             turretSpeedEnabled = Settings.TurretSpeedEnabled, rapidFireEnabled = Settings.TankRapidFire },
@@ -3933,6 +4158,7 @@ _G.AutoLeadAssistUnload = function()
     for _, entry in ipairs(shotTracker.entries) do shotTracker.remove(entry) end
     releaseArtillerySlave()
     if uiInsertConn then uiInsertConn:Disconnect() end
+    shellRedirection.stop()
     if vibeUi then pcall(function() vibeUi:Unload() end) end
     if screenGui then screenGui:Destroy() end
     espStats.gui:Destroy()

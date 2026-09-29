@@ -54,6 +54,7 @@ local fireReadiness = {check=function() return nil end}
 local aimCache, visualDiagnostics = {},{}
 local function setFreecamHint() end
 local refreshAimCache
+local shellRedirection = {update=function() end}
 local wh = {}
 local shotTracker = {reject=function() end}
 ]]
