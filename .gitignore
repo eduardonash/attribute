@@ -4,3 +4,6 @@
 !/README.md
 !/PROJECT.md
 !/attribute.lua
+!/tests/
+/tests/*
+!/tests/adaptive-ballistics.spec.lua

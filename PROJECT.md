@@ -2,7 +2,19 @@
 
 ## 1. Overview
 
-### Artillery solver and native auto-elevation revision (2026-09-28)
+### Unified adaptive aiming regression fix (2026-09-28)
+
+**Aim → Assist → Adaptive Aim** replaces the competing Auto Lead / Auto Ballistic toggles. Every finite target uses the same policy in normal view and freecam: solve and collision-trace the low root first, return it immediately when legal and clear, then try the high root only after low fails. A raised barrel, artillery classification, or remembered high-mode setting cannot force a lob. Both candidates respect actual gun elevation limits and ammunition lifetime; high arcs do not extend physical maximum range.
+
+Clearance now calls the same `traceTrajectory` implementation as the preview. A failed low path can use the full legal elevation interval for high fallback, without a narrow current-pitch window or clamping an invalid launch angle into range. If both paths fail, the finite target is marked invalid; any retained obstruction preview is display-only. Native-handler and direct-fire paths reject that invalid assisted shot instead of silently using the bore.
+
+Native freecam auto-elevation and the 3° alignment gate apply **only to a selected high fallback**. Low shots retain ordinary cursor tracking and the existing near-backward bearing guard. Switching high → low, losing the seat, or losing a solution releases an owned native angle command. Turning Adaptive Aim off restores normal native firing behavior. Legacy settings migrate their enabled state only; an explicit new Adaptive Aim setting takes precedence.
+
+Verification: full-source compilation passed without execution. The reproducible `tests/adaptive-ballistics.spec.lua` suite passed **40 assertions** using extracted production functions and mocked scene/control objects: low-first early return, terrain obstruction fallback and recovery, mechanical/lifetime/range rejection, dragged endpoints, uphill/downhill targets, a >90-second high fallback, low/high firing gates, command release, seat cleanup, and settings migration. Call the test module's returned function with the current script source in a Luau runtime providing Vector2/Vector3/CFrame. No scene mutations, full reload, real turret movement or shots were performed. Live firing/impact validation remains pending.
+
+### Previous artillery solver and native auto-elevation revision (2026-09-28)
+
+Historical revision below; its high-preference and low-shot auto-lay behavior are superseded by the adaptive fix above.
 
 The pre-revision source already had both quadratic roots, collision-based high-arc fallback and full `TurretInfo.anglelimits.vertical` searches; the reported minus-root-only / ±8° assumptions did not describe this version. This revision addresses remaining inconsistencies:
 
@@ -70,11 +82,11 @@ flowchart TD
    - Nearby surface hits remain finite targets. The old under-150-stud rule that silently replaced a close ground hit with a barrel-elevation bearing has been removed.
 
 3. **Launch-direction solver (`solveBallistic`, `getLaunchDirection`)**
-   - For a finite target in normal auto-lead mode, uses the minus-sign (lower-angle) no-drag ballistic root:
+   - For a finite target, Adaptive Aim first evaluates the minus-sign (lower-angle) no-drag ballistic root:
      $$\tan(\theta) = \frac{v^2 \pm \sqrt{v^4 - g_{\text{mag}}(g_{\text{mag}} x^2 + 2 y v^2)}}{g_{\text{mag}} x}$$
-   - Auto-lead uses the same automatic arc selection in normal view and freecam: choose a legal, clear low root first, then a legal, clear high root if the low path is blocked. `AutoBallistic` explicitly prefers a clear high root. Distance alone does not force a high arc or extend maximum range. With horizontal drag, the solver searches the legal elevation interval numerically. A blocked path, unreachable elevation, or out-of-range target is reported.
-   - Freecam artillery auto-elevation feeds angular error into the native `CmdAngle` sight input while the matching gunner seat owns the turret. It is not restricted to FCS metadata, but the native optic/control mode must consume that input. It yields to another owner or stalled control and clears its own command on exit/unload. High arcs and auto-laid shots require actual barrel alignment within about 3° before assisted firing.
-   - An unreachable finite target has no assisted solution; there is **no automatic 45-degree fallback**. Open sky preserves the barrel elevation and uses the cursor bearing. Direct firing falls back to the actual bore when assistance is unavailable, matching native gunner fire. Near-backward assisted directions are rejected.
+   - Adaptive Aim uses the same automatic arc selection in normal view and freecam: choose a legal, clear low root first, then a legal, clear high root only if low fails. There is no separate high-preference toggle. Distance alone does not force a high arc or extend maximum range. With horizontal drag, both physical roots are found numerically before mechanical filtering. A blocked path, unreachable elevation, or out-of-range target is reported.
+   - For a selected high fallback only, freecam artillery auto-elevation feeds angular error into the native `CmdAngle` sight input while the matching gunner seat owns the turret. It is not restricted to FCS metadata, but the native optic/control mode must consume that input. It yields to another owner or stalled control and clears its own command on return to low arc or exit/unload. High arcs require actual barrel alignment within about 3° before assisted firing; ordinary low shots do not use this gate.
+   - An unreachable finite target has no assisted solution; there is **no automatic 45-degree fallback** and no silent bore fallback for an invalid assisted target. Open sky remains a bearing (artillery preserves barrel elevation). Turning Adaptive Aim off restores ordinary bore firing. Near-backward assisted directions are rejected.
 
 4. **Collision-aware trajectory trace (`traceTrajectory`)**
    - Both no-drag and dragged previews use the same analytic sampler as clearance selection (parabolic vertical motion and continuous exponential horizontal drag). Collision samples use the `Projectile` group where available.
@@ -151,7 +163,7 @@ Impact and shot-readout labels use bright text with a dark stroke over a faint d
 
 - `DisableFiringShake` defaults on and is remembered across reloads. The **Freecam → Camera → Disable Firing Shake** toggle zeros only the three client-side cannon muzzle-shake presets (`RecoilShake`, `RecoilShake2`, `RecoilShake3`). This also suppresses nearby cannon muzzle shake using those presets, but leaves explosion shake, physical recoil, firing, and camera controls unchanged. Original values are restored on disable/unload unless another owner changed them. No render loop or new firing hook is added. Diagnostics expose availability and errors; unsupported preset layouts fail without repeatedly retrying.
 
-- `EnableAutoLead`, `Trajectory`, `AutoLead`, `ShowBallistic`, and `AutoBallistic` control the aiming assist and bore/lead previews. `AutoBallistic` defaults off; the others default on except `ShowBallistic`.
+- `EnableAutoLead` remains the master assist/preview switch. `AdaptiveAim` replaces both `AutoLead` and `AutoBallistic`, defaults on for fresh settings, and always uses low-first selection. `Trajectory` defaults on; `ShowBallistic` (additional bore preview) defaults off. Old aiming flags are read only during enabled-state migration.
 - `ExplosionRadius` toggles the compact filled impact-zone cue; `ShowDistance` controls both the zone distance label and bottom-left distance readout. `FlightTimer` controls flight-time information.
 - `OwnShellHighlight`, `ShotProgress`, and `ShotStatus` independently toggle own-projectile highlighting, the flight completion path, and shot confirmation. They default on and are remembered across reloads.
 - `EnemyTankESP`, `PlayerESP`, `ESPNames`, `ESPHealth`, and `ESPBoxes` are separately toggleable and default on. Player ESP draws a projected body-size outline, name, and narrow health bar; enemy tanks use engine Highlights. Enemy filtering excludes the local player's team and neutral players. The scanners cap active markers at 16 nearby tanks and 24 nearby players.
@@ -159,7 +171,7 @@ Impact and shot-readout labels use bright text with a dark stroke over a faint d
 - `AimSource` starts as `"Mouse"` and can be changed to `"Camera"`; active freecam forces mouse aiming.
 - `Freecam` starts off. `FreecamSpeed` starts at `3.5` and is adjustable from `0.5` to `20`. Freecam and zoom keys can be rebound in the Freecam tab. Zoom follows the cursor while preserving the world ray under it; the previous camera adjustment is removed before the next camera update to prevent drift. Zoom starts off; its field of view defaults to `25°` and can be adjusted from `10°` to `70°`.
 - `ZeroEnemyArmor` defaults on. It sets the client-visible `ArmourValue` and related composite/HEAT/slat resistance attributes to zero for enemy tanks only, tracks newly spawned plates, and restores original local values when disabled or unloaded. Server-side hit and damage rules may ignore these local changes.
-- ESP, armor, keybind, freecam-speed, zoom-FOV, and `AutoBallistic` choices are remembered across script reloads in `_G.AutoLeadAssistRemembered`.
+- ESP, armor, keybind, freecam-speed, zoom-FOV, and `AdaptiveAim` choices are remembered across script reloads in `_G.AutoLeadAssistRemembered`.
 
 ---
 

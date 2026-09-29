@@ -83,6 +83,10 @@ local function stylePanel(panel)
 end
 
 local rememberedSettings = _G.AutoLeadAssistRemembered or {}
+local adaptiveAim = rememberedSettings.AdaptiveAim
+if adaptiveAim == nil then
+    adaptiveAim = rememberedSettings.AutoLead ~= false or rememberedSettings.AutoBallistic == true
+end
 local Settings = {
     EnableAutoLead = true,
     ShowBallistic = false,
@@ -93,8 +97,7 @@ local Settings = {
     ShotProgress = rememberedSettings.ShotProgress ~= false,
     ShotStatus = rememberedSettings.ShotStatus ~= false,
     Trajectory = true,
-    AutoLead = true,
-    AutoBallistic = rememberedSettings.AutoBallistic == true,
+    AdaptiveAim = adaptiveAim == true,
     ArtilleryAutoLay = rememberedSettings.ArtilleryAutoLay ~= false,
     InfiniteAmmo = rememberedSettings.InfiniteAmmo == true,
     TurretSpeedEnabled = rememberedSettings.TurretSpeedEnabled == true,
@@ -631,10 +634,10 @@ do
             settingToggle(aimAssist, "Infinite Ammo / No Reload", "InfiniteAmmo",
                 "Opt-in local reload suppression. Server ammo rules still apply; off by default.")
             settingToggle(aimAssist, "Enable Assist", "EnableAutoLead", "Master aiming and preview switch.")
-            settingToggle(aimAssist, "Auto Lead", "AutoLead", "Steer shots toward the selected point.")
-            settingToggle(aimAssist, "Auto Ballistic", "AutoBallistic", "Prefer a clear high arc within the gun's elevation limits.")
+            settingToggle(aimAssist, "Adaptive Aim", "AdaptiveAim",
+                "Low arc first. Use a high lob only when the low trajectory fails clearance or gun limits. Never force high arcs.")
             settingToggle(aimAssist, "Freecam Artillery Auto-Elevation", "ArtilleryAutoLay",
-                "Native gunner angle commands align both axes. Some controllers require the gunner optic active; stalled control yields to manual aim.")
+                "Align both axes only for a selected high-arc fallback. Direct shots keep normal tracking; some native modes require the gunner optic active.")
             local aimTarget = aimTab:Section({ Name = "Targeting", Side = 2 })
             aimTarget:Dropdown({
                 Name = "Aim Source",
@@ -1293,16 +1296,9 @@ local function pathReachesTarget(startPos, targetPos, direction, speed, gravityY
     local flightTime = ballistics.time(horizontalDistance,horizontalSpeed,drag)
     if not flightTime or flightTime > (maxTime or 60) then return false end
     local steps = ballistics.steps(flightTime,gravityY,drag,speed)
-    local previous = startPos
     local tolerance = math.max(12, horizontalDistance * 0.002)
-    for i = 1, steps do
-        local t = flightTime * i / steps
-        local nextPos = ballistics.sample(startPos,direction*speed,gravityY,drag,t)
-        local hit = workspace:Raycast(previous, nextPos - previous, params)
-        if hit then return (hit.Position - targetPos).Magnitude <= tolerance end
-        previous = nextPos
-    end
-    return (previous - targetPos).Magnitude <= tolerance
+    local finish = ballistics.trace(startPos,direction*speed,gravityY,drag,params,steps,flightTime/steps)
+    return (finish-targetPos).Magnitude <= tolerance
 end
 
 local function solveDraggedArcs(startPos, targetPos, speed, gravityY, drag, minPitch, maxPitch, maxTime)
@@ -1349,67 +1345,61 @@ local function solveDraggedArcs(startPos, targetPos, speed, gravityY, drag, minP
 end
 
 local function getLaunchDirection(startPos, targetPos, targetPart, speed, gravityY, drag,
-    artilleryMode, preferHigh, boreDir, minPitch, maxPitch, params, maxTime, up)
+    preserveBarrelPitch, boreDir, minPitch, maxPitch, params, maxTime, up)
     local offset = targetPos - startPos
     if offset.Magnitude < 0.1 then return nil, "unreachable" end
     if not targetPart then
-        -- Open sky has a bearing but no finite coordinate to land a shell on.
-        if artilleryMode and boreDir then
-            local horizontal = Vector3.new(offset.X, 0, offset.Z)
-            if horizontal.Magnitude < 0.1 then return boreDir, "barrel" end
-            local vertical = math.clamp(boreDir.Y, -0.999, 0.999)
-            return (horizontal.Unit * math.sqrt(1 - vertical * vertical) + Vector3.yAxis * vertical).Unit, "barrel"
+        -- Sky is a bearing, not a requested landing coordinate.
+        if preserveBarrelPitch and boreDir then
+            local horizontal = Vector3.new(offset.X,0,offset.Z)
+            if horizontal.Magnitude < 0.1 then return boreDir,"barrel" end
+            local vertical = math.clamp(boreDir.Y,-0.999,0.999)
+            return (horizontal.Unit*math.sqrt(1-vertical*vertical)+Vector3.yAxis*vertical).Unit,"barrel"
         end
-        return offset.Unit, "bearing"
+        return offset.Unit,"bearing"
     end
 
-    local lowDir, lowPossible, lowPitch = solveBallistic(startPos, targetPos, speed, gravityY, false)
-    if not artilleryMode then
-        return lowPossible and lowDir or nil, lowPossible and "low" or "Target exceeds ammunition range"
-    end
-    local highDir, highPossible, highPitch = solveBallistic(startPos, targetPos, speed, gravityY, true)
-    if not lowPossible and not highPossible and (not drag or drag <= 1e-5) then
-        return nil, "Target exceeds ammunition range"
-    end
+    local draggedLow,draggedHigh
     if drag and drag > 1e-5 then
-        local draggedLow, draggedHigh = solveDraggedArcs(startPos, targetPos, speed, gravityY,
-            drag, minPitch, maxPitch, maxTime)
-        lowDir, lowPitch, lowPossible = draggedLow and draggedLow.direction,
-            draggedLow and draggedLow.pitch, draggedLow ~= nil
-        highDir, highPitch, highPossible = draggedHigh and draggedHigh.direction,
-            draggedHigh and draggedHigh.pitch, draggedHigh ~= nil
+        draggedLow,draggedHigh = solveDraggedArcs(startPos,targetPos,speed,gravityY,drag,minPitch,maxPitch,maxTime)
     end
+    local range = Vector3.new(offset.X,0,offset.Z).Magnitude
     local margin = math.rad(0.25)
-    -- Gun limits are relative to the vehicle, not necessarily world Y.
-    if up then
-        lowPitch = lowDir and math.asin(math.clamp(lowDir:Dot(up),-1,1))
-        highPitch = highDir and math.asin(math.clamp(highDir:Dot(up),-1,1))
+    local physical,legal,inLifetime = false,false,false
+    local blockedPreview
+    local function candidate(high)
+        local direction,possible,pitch
+        if drag and drag > 1e-5 then
+            local root
+            if high then root = draggedHigh else root = draggedLow end
+            direction,possible,pitch = root and root.direction,root ~= nil,root and root.pitch
+        else
+            direction,possible,pitch = solveBallistic(startPos,targetPos,speed,gravityY,high)
+        end
+        if not possible or not direction then return nil end
+        physical = true
+        if up then pitch = math.asin(math.clamp(direction:Dot(up),-1,1)) end
+        if not pitch or pitch < minPitch-margin or pitch > maxPitch+margin then return nil end
+        legal = true
+        local time = ballistics.time(range,Vector3.new(direction.X,0,direction.Z).Magnitude*speed,drag)
+        if not time or time > (maxTime or 60) then return nil end
+        inLifetime = true
+        if pathReachesTarget(startPos,targetPos,direction,speed,gravityY,drag,params,maxTime) then
+            return direction
+        end
+        blockedPreview = blockedPreview or direction
     end
-    local lowLegal = lowPossible and lowPitch and lowPitch >= minPitch - margin and lowPitch <= maxPitch + margin
-    local highLegal = highPossible and highPitch and highPitch >= minPitch - margin and highPitch <= maxPitch + margin
-    local function clear(direction)
-        return pathReachesTarget(startPos, targetPos, direction, speed, gravityY, drag, params, maxTime)
-    end
-    if preferHigh and highLegal and clear(highDir) then return highDir, "high" end
-    -- Automatic selection is distance/clearance based, independent of camera
-    -- mode and current barrel angle. A high arc does not extend maximum range.
-    if lowLegal and clear(lowDir) then return lowDir, "low" end
-    if highLegal and clear(highDir) then return highDir, "high" end
-    if not highLegal and not lowLegal then return nil, "target outside gun elevation" end
-    local function withinLifetime(direction,legal)
-        if not legal then return false end
-        local range=Vector3.new(offset.X,0,offset.Z).Magnitude
-        local horizontal=Vector3.new(direction.X,0,direction.Z).Magnitude*speed
-        local time=ballistics.time(range,horizontal,drag)
-        return time and time <= (maxTime or 60)
-    end
-    if not withinLifetime(lowDir,lowLegal) and not withinLifetime(highDir,highLegal) then
-        return nil,"flight exceeds ammunition lifetime"
-    end
-    -- Retain a display-only candidate so an obstruction can shorten the red
-    -- preview instead of making it jump to the unrelated bore trajectory.
-    return nil, "trajectory blocked", (preferHigh and highLegal and highDir)
-        or (lowLegal and lowDir) or (highLegal and highDir)
+    -- One policy for normal view and freecam. Return the clear low solution
+    -- immediately; neither remembered settings nor barrel pitch can force high.
+    local low = candidate(false)
+    if low then return low,"low" end
+    local high = candidate(true)
+    if high then return high,"high" end
+    if not physical then return nil,"Target exceeds ammunition range" end
+    if not legal then return nil,"target outside gun elevation" end
+    if not inLifetime then return nil,"flight exceeds ammunition lifetime" end
+    -- Only display a collision-shortened candidate; never drive it or fire it.
+    return nil,"trajectory blocked",blockedPreview
 end
 
 -- Canonical MTC Explosion Blast Radius Calculator
@@ -1743,6 +1733,7 @@ local function traceTrajectory(startPos, initialVel, gravityY, drag, params, max
     end
     return previous,nil,duration,steps,velocity
 end
+ballistics.trace = traceTrajectory
 
 -- Main Render Loop
 local aimCache = { direction = nil, vehicle = nil, weapon = nil, targetPos = nil, updated = 0, reason = "waiting for weapon", alignment = 0, clearance = false }
@@ -1861,7 +1852,7 @@ RunService:BindToRenderStep(VISUAL_RENDER_NAME, FREECAM_PRIORITY + 2, function()
     local simSteps = math.clamp(math.ceil(flightTime / 0.18), 8, 120)
     local simDt = flightTime / simSteps
 
-    local aimRequested = Settings.AutoLead or Settings.AutoBallistic
+    local aimRequested = Settings.AdaptiveAim
     local plannedAim = aimRequested and previewDirection ~= nil
     local assistedAim = aimRequested and aimCache.direction ~= nil and aimCache.reason == "ready"
     -- An invalid finite cursor target must not silently become the bore path.
@@ -2992,10 +2983,9 @@ local function calculateShotDirection(veh, wData, startPos, tankVel, speed, grav
     local estTime = (targetPos - startPos).Magnitude / math.max(speed, 1)
     local predictedTarget = targetPos + targetVel * estTime
     local artilleryMode = wData and wData.weapon and wData.weapon:GetAttribute("ARTY") == true
-    local indirectMode = Settings.AutoLead or Settings.AutoBallistic or artilleryMode
     local minPitch, maxPitch = getTurretPitchLimits(wData and wData.turret)
     local idealLaunchDir, arc, previewDir = getLaunchDirection(startPos, predictedTarget, targetPart, speed,
-        gravityY, drag, indirectMode, Settings.AutoBallistic,
+        gravityY, drag, artilleryMode,
         boreDir, minPitch, maxPitch, getClearanceParams(veh), ballistics.lifetime(wData.shellData),
         veh.PrimaryPart and veh.PrimaryPart.CFrame.UpVector or Vector3.yAxis)
     if not idealLaunchDir then
@@ -3052,11 +3042,10 @@ local function updateArtillerySlave(wData, startPos, direction, arc)
     local seat = hum and hum.SeatPart
     local control = wData and wData.turret and wData.turret:FindFirstChild("Control")
     local shouldSlave = Settings.ArtilleryAutoLay and Settings.EnableAutoLead
-        and (Settings.AutoLead or Settings.AutoBallistic)
+        and Settings.AdaptiveAim
         and Settings.Freecam and freecamActive and wData and wData.weapon
-        and (wData.weapon:GetAttribute("ARTY") == true or Settings.AutoBallistic)
         and control and control.Value == seat and seat ~= nil
-        and direction ~= nil and (arc == "high" or arc == "low")
+        and direction ~= nil and arc == "high"
     if not shouldSlave then releaseArtillerySlave(); return false end
     if state.stalled then
         if state.stalled:Dot(direction) > math.cos(math.rad(3)) then return false end
@@ -3122,6 +3111,7 @@ refreshAimCache = function()
             aimCache.targetPos = nil
             aimCache.clearance = false
             aimCache.fireBlock = "No active weapon"
+            aimCache.waitForAlignment, aimCache.solutionBlocked = false, false
             aimCache.reason = "no active weapon"
             return
         end
@@ -3151,9 +3141,12 @@ refreshAimCache = function()
         aimCache.turretSlaveActive = updateArtillerySlave(weapon, startPos, direction, arc)
         -- Low-arc correction has the same bearing guard in either camera.
         -- Only a selected high lob requires precise barrel alignment.
-        local slewing = (arc == "high" or aimCache.turretSlaveActive) and direction ~= nil
+        local slewing = Settings.EnableAutoLead and Settings.AdaptiveAim and arc == "high" and direction ~= nil
             and aimCache.alignment < math.cos(math.rad(3))
         aimCache.waitForAlignment = slewing
+        aimCache.solutionBlocked = Settings.EnableAutoLead and Settings.AdaptiveAim
+            and targetPart ~= nil and direction == nil
+        if aimCache.solutionBlocked and not aimCache.fireBlock then aimCache.fireBlock = arc end
         if slewing and not aimCache.fireBlock then
             aimCache.fireBlock = not aimCache.turretSlaveActive and ballistics.slave.reason
                 or "Waiting for barrel azimuth/elevation alignment"
@@ -3179,6 +3172,7 @@ refreshAimCache = function()
         aimCache.direction = nil
         aimCache.weapon = nil
         aimCache.previewDirection = nil
+        aimCache.waitForAlignment, aimCache.solutionBlocked = false, false
         aimCache.reason = tostring(err)
     end
     visualDiagnostics.aimMs = (os.clock() - now) * 1000
@@ -3451,7 +3445,7 @@ local function hookSingleWeaponModule(wm)
             weapon = trackedWeapon, vehicle = aimCache.vehicle, attempt = shotTracker.attempts,
             sentAt = os.clock(), predictedTime = visualDiagnostics.flightTime
         } or nil
-        if Settings.EnableAutoLead and (Settings.AutoLead or Settings.AutoBallistic) and bulletData
+        if Settings.EnableAutoLead and Settings.AdaptiveAim and bulletData
             and bulletData.replicate == true and bulletData.directions then
             local originalDirection = bulletData.directions[1]
             local shotState = { applied = false, reason = "not checked", originalDirection = tostring(originalDirection), freecam = freecamActive, arc = aimCache.arc, highArc = aimCache.arc == "high", time = os.clock() }
@@ -3614,10 +3608,10 @@ local function installHooks()
             hookedWeaponHandler = wh
 
             wh.fireWeapon = function(p56, p57, u58, p59, p60, p61, p62, p63)
-                if Settings.EnableAutoLead and (Settings.AutoLead or Settings.AutoBallistic)
+                if Settings.EnableAutoLead and Settings.AdaptiveAim
                     and aimCache.vehicle == p59 and aimCache.weapon and aimCache.weapon.weapon == u58
-                    and aimCache.waitForAlignment then
-                    shotTracker.reject("Waiting for barrel azimuth/elevation alignment")
+                    and (aimCache.waitForAlignment or aimCache.solutionBlocked) then
+                    shotTracker.reject(aimCache.fireBlock or "No ready adaptive shot solution")
                     return false
                 end
                 local held = heldFire.matches(p59, u58)
@@ -3699,9 +3693,9 @@ triggerDirectFire = function()
         setFreecamHint(lastDirectFireError)
         return false, lastDirectFireError
     end
-    -- An unavailable assist must not disable the normal weapon. Match native
-    -- gunner clicks: fire along the bore until the requested arc is ready.
-    local aimDirection = Settings.EnableAutoLead and (Settings.AutoLead or Settings.AutoBallistic)
+    -- Invalid finite targets and pending high arcs were rejected above.
+    -- With assistance disabled, retain the normal bore direction.
+    local aimDirection = Settings.EnableAutoLead and Settings.AdaptiveAim
         and aimCache.reason == "ready" and aimCache.direction or boreDir
     local ok, fired = pcall(function()
         -- MTC inserts -p62 into bulletData.directions, so pass the negative
@@ -3745,8 +3739,7 @@ _G.AutoLeadAssistDiagnostics = function()
             commandOwned = ballistics.slave.value ~= nil, waitingForAlignment = aimCache.waitForAlignment == true },
         clickTeleport = Settings.FreecamClickTP,
         heldFire = { active = next(heldFire.inputs) ~= nil, busy = heldFire.busy == true },
-        autoLead = Settings.AutoLead,
-        autoBallistic = Settings.AutoBallistic,
+        adaptiveAim = Settings.AdaptiveAim,
         infiniteAmmo = Settings.InfiniteAmmo,
         vehicleExtras = { localEdits = #extras.edits, error = extras.tuningError,
             turretSpeedEnabled = Settings.TurretSpeedEnabled, rapidFireEnabled = Settings.TankRapidFire },
