@@ -95,6 +95,7 @@ local Settings = {
     Trajectory = true,
     AutoLead = true,
     AutoBallistic = rememberedSettings.AutoBallistic == true,
+    ArtilleryAutoLay = rememberedSettings.ArtilleryAutoLay ~= false,
     InfiniteAmmo = rememberedSettings.InfiniteAmmo == true,
     TurretSpeedEnabled = rememberedSettings.TurretSpeedEnabled == true,
     TurretSpeedMultiplier = math.clamp(tonumber(rememberedSettings.TurretSpeedMultiplier) or 1, 0.25, 3),
@@ -632,6 +633,8 @@ do
             settingToggle(aimAssist, "Enable Assist", "EnableAutoLead", "Master aiming and preview switch.")
             settingToggle(aimAssist, "Auto Lead", "AutoLead", "Steer shots toward the selected point.")
             settingToggle(aimAssist, "Auto Ballistic", "AutoBallistic", "Prefer a clear high arc within the gun's elevation limits.")
+            settingToggle(aimAssist, "Freecam Artillery Auto-Elevation", "ArtilleryAutoLay",
+                "Native gunner angle commands align both axes. Some controllers require the gunner optic active; stalled control yields to manual aim.")
             local aimTarget = aimTab:Section({ Name = "Targeting", Side = 2 })
             aimTarget:Dropdown({
                 Name = "Aim Source",
@@ -1084,6 +1087,34 @@ local function getBoreForwardDirection(wData)
 end
 
 -- Exact Closed-Form Ballistics Solver: Solves launch unit vector to hit targetPos under gravity
+local ballistics = { maxTime = 120 }
+function ballistics.lifetime(shell)
+    return math.clamp(tonumber(shell and shell.Lifetime) or 60, 0.1, ballistics.maxTime)
+end
+function ballistics.time(range, horizontalSpeed, drag)
+    if range < 0.001 then return 0 end
+    if horizontalSpeed <= 0.001 then return nil end
+    local d = math.max(tonumber(drag) or 0, 0)
+    if d <= 1e-5 then return range / horizontalSpeed end
+    local remaining = 1 - d * range / horizontalSpeed
+    if remaining <= 0 then return nil end
+    return -math.log(remaining) / d
+end
+-- Shared continuous horizontal-drag model. Native variable-step physics can
+-- still differ slightly, but selection, clearance and preview now agree.
+function ballistics.sample(start, velocity, gravity, drag, t)
+    local d = math.max(tonumber(drag) or 0, 0)
+    local decay = d > 1e-5 and math.exp(-d*t) or 1
+    local travel = d > 1e-5 and (1-decay)/d or t
+    local horizontal = Vector3.new(velocity.X,0,velocity.Z)
+    return start + horizontal*travel + Vector3.yAxis*(velocity.Y*t + 0.5*gravity*t*t),
+        horizontal*decay + Vector3.yAxis*(velocity.Y + gravity*t)
+end
+function ballistics.steps(time, gravity, drag, speed)
+    local acceleration = math.abs(gravity) + math.max(drag or 0,0)*speed
+    local dt = math.min(0.25, math.sqrt(4/math.max(acceleration,1)))
+    return math.clamp(math.ceil(time/dt), 8, 192)
+end
 local function solveBallistic(startPos, targetPos, speed, g, highArc)
     local diff = targetPos - startPos
     if diff.Magnitude < 0.1 then return Vector3.new(0, 1, 0), false end
@@ -1091,7 +1122,9 @@ local function solveBallistic(startPos, targetPos, speed, g, highArc)
     local distXZ = Vector3.new(diff.X, 0, diff.Z).Magnitude
     local diffY = diff.Y
     if distXZ < 0.1 then
-        return Vector3.new(0, diffY >= 0 and 1 or -1, 0), true
+        local up = highArc or diffY >= 0
+        local possible = diffY <= 0 or speed*speed >= 2*math.abs(g)*diffY
+        return Vector3.new(0, up and 1 or -1, 0), possible, up and math.pi/2 or -math.pi/2
     end
 
     local gMag = math.abs(g)
@@ -1101,13 +1134,14 @@ local function solveBallistic(startPos, targetPos, speed, g, highArc)
     local disc = v4 - gMag * (gMag * distXZ * distXZ + 2 * diffY * v2)
     local dirXZ = Vector3.new(diff.X, 0, diff.Z).Unit
 
-    if disc >= 0 then
-        local sqrtDisc = math.sqrt(disc)
+    if disc >= -v4 * 1e-12 then
+        local sqrtDisc = math.sqrt(math.max(0, disc))
         local tanTheta
         if highArc then
             tanTheta = (v2 + sqrtDisc) / (gMag * distXZ)
         else
-            tanTheta = (v2 - sqrtDisc) / (gMag * distXZ)
+            -- Rationalized minus root avoids cancellation for shallow shots.
+            tanTheta = (gMag*distXZ*distXZ + 2*diffY*v2) / (distXZ*(v2 + sqrtDisc))
         end
         local theta = math.atan(tanTheta)
         return (dirXZ * math.cos(theta) + Vector3.new(0, math.sin(theta), 0)).Unit, true, theta
@@ -1251,30 +1285,19 @@ local function getClearanceParams(veh)
     return clearanceParams
 end
 
-local function pathReachesTarget(startPos, targetPos, direction, speed, gravityY, drag, params)
+local function pathReachesTarget(startPos, targetPos, direction, speed, gravityY, drag, params, maxTime)
     local offset = targetPos - startPos
     local horizontalDistance = Vector3.new(offset.X, 0, offset.Z).Magnitude
     local horizontalSpeed = Vector3.new(direction.X, 0, direction.Z).Magnitude * speed
     if horizontalDistance < 0.1 or horizontalSpeed < 0.1 then return false end
-    local d = math.max(tonumber(drag) or 0, 0)
-    local flightTime
-    if d > 1e-5 then
-        local remaining = 1 - d * horizontalDistance / horizontalSpeed
-        if remaining <= 0 then return false end
-        flightTime = -math.log(remaining) / d
-    else
-        flightTime = horizontalDistance / horizontalSpeed
-    end
-    if flightTime > 60 then return false end
-    local horizontalDirection = Vector3.new(direction.X, 0, direction.Z).Unit
-    local steps = math.clamp(math.ceil(flightTime / 0.25), 8, 48)
+    local flightTime = ballistics.time(horizontalDistance,horizontalSpeed,drag)
+    if not flightTime or flightTime > (maxTime or 60) then return false end
+    local steps = ballistics.steps(flightTime,gravityY,drag,speed)
     local previous = startPos
     local tolerance = math.max(12, horizontalDistance * 0.002)
     for i = 1, steps do
         local t = flightTime * i / steps
-        local distance = d > 1e-5 and horizontalSpeed * (1 - math.exp(-d * t)) / d or horizontalSpeed * t
-        local nextPos = startPos + horizontalDirection * distance
-            + Vector3.yAxis * (direction.Y * speed * t + 0.5 * gravityY * t * t)
+        local nextPos = ballistics.sample(startPos,direction*speed,gravityY,drag,t)
         local hit = workspace:Raycast(previous, nextPos - previous, params)
         if hit then return (hit.Position - targetPos).Magnitude <= tolerance end
         previous = nextPos
@@ -1282,45 +1305,51 @@ local function pathReachesTarget(startPos, targetPos, direction, speed, gravityY
     return (previous - targetPos).Magnitude <= tolerance
 end
 
-local function solveDraggedArcs(startPos, targetPos, speed, gravityY, drag, minPitch, maxPitch)
+local function solveDraggedArcs(startPos, targetPos, speed, gravityY, drag, minPitch, maxPitch, maxTime)
     local offset = targetPos - startPos
     local horizontal = Vector3.new(offset.X, 0, offset.Z)
     local range = horizontal.Magnitude
     if range < 0.1 or speed <= 0 then return nil, nil end
     local unit = horizontal.Unit
-    local lowLimit = math.max(minPitch, math.rad(-89))
-    local highLimit = math.min(maxPitch, math.rad(89))
+    -- Solve both physical roots before applying mechanical limits. A root
+    -- outside the gun window must not cause the remaining high root to be
+    -- incorrectly labelled as the low root.
+    local minimumVX = drag*range/(1-math.exp(-drag*(maxTime or 60)))
+    if minimumVX > speed then return nil, nil end
+    local limit = math.acos(math.clamp(minimumVX/speed,0,1))
+    local lowLimit, highLimit = -limit, limit
     local function heightError(pitch)
         local vx = speed * math.cos(pitch)
         local remaining = 1 - drag * range / vx
         if remaining <= 0 then return nil end
         local t = -math.log(remaining) / drag
-        if t > 60 then return nil end
         return speed * math.sin(pitch) * t + 0.5 * gravityY * t * t - offset.Y
     end
-    local roots = {}
-    local lastPitch, lastError = lowLimit, heightError(lowLimit)
-    for i = 1, 48 do
-        local pitch = lowLimit + (highLimit - lowLimit) * i / 48
-        local err = heightError(pitch)
-        if lastError and err and lastError * err <= 0 then
-            local a, b, fa = lastPitch, pitch, lastError
-            for _ = 1, 18 do
-                local mid = (a + b) * 0.5
-                local fm = heightError(mid)
-                if not fm then break end
-                if fa * fm <= 0 then b = mid else a, fa = mid, fm end
-            end
-            local root = (a + b) * 0.5
-            roots[#roots + 1] = { direction = (unit * math.cos(root) + Vector3.yAxis * math.sin(root)).Unit, pitch = root }
-        end
-        lastPitch, lastError = pitch, err
+    local a,b = lowLimit,highLimit
+    for _ = 1, 40 do
+        local l,r = a+(b-a)/3,b-(b-a)/3
+        if heightError(l) < heightError(r) then a=l else b=r end
     end
-    return roots[1], #roots > 1 and roots[#roots] or nil
+    local peak = (a+b)*0.5
+    if heightError(peak) < -0.01 then return nil,nil end
+    local function rootBetween(a,b)
+        local fa,fb = heightError(a),heightError(b)
+        if math.abs(fa) < 0.01 then b=a
+        elseif math.abs(fb) < 0.01 then a=b
+        elseif fa*fb > 0 then return nil end
+        for _ = 1, 28 do
+            local mid=(a+b)*0.5
+            local fm=heightError(mid)
+            if fa*fm <= 0 then b=mid else a,fa=mid,fm end
+        end
+        local pitch=(a+b)*0.5
+        return { direction=(unit*math.cos(pitch)+Vector3.yAxis*math.sin(pitch)).Unit,pitch=pitch }
+    end
+    return rootBetween(lowLimit,peak),rootBetween(peak,highLimit)
 end
 
 local function getLaunchDirection(startPos, targetPos, targetPart, speed, gravityY, drag,
-    artilleryMode, preferHigh, boreDir, minPitch, maxPitch, params)
+    artilleryMode, preferHigh, boreDir, minPitch, maxPitch, params, maxTime, up)
     local offset = targetPos - startPos
     if offset.Magnitude < 0.1 then return nil, "unreachable" end
     if not targetPart then
@@ -1344,17 +1373,22 @@ local function getLaunchDirection(startPos, targetPos, targetPart, speed, gravit
     end
     if drag and drag > 1e-5 then
         local draggedLow, draggedHigh = solveDraggedArcs(startPos, targetPos, speed, gravityY,
-            drag, minPitch, maxPitch)
+            drag, minPitch, maxPitch, maxTime)
         lowDir, lowPitch, lowPossible = draggedLow and draggedLow.direction,
             draggedLow and draggedLow.pitch, draggedLow ~= nil
         highDir, highPitch, highPossible = draggedHigh and draggedHigh.direction,
             draggedHigh and draggedHigh.pitch, draggedHigh ~= nil
     end
     local margin = math.rad(0.25)
+    -- Gun limits are relative to the vehicle, not necessarily world Y.
+    if up then
+        lowPitch = lowDir and math.asin(math.clamp(lowDir:Dot(up),-1,1))
+        highPitch = highDir and math.asin(math.clamp(highDir:Dot(up),-1,1))
+    end
     local lowLegal = lowPossible and lowPitch and lowPitch >= minPitch - margin and lowPitch <= maxPitch + margin
     local highLegal = highPossible and highPitch and highPitch >= minPitch - margin and highPitch <= maxPitch + margin
     local function clear(direction)
-        return pathReachesTarget(startPos, targetPos, direction, speed, gravityY, drag, params)
+        return pathReachesTarget(startPos, targetPos, direction, speed, gravityY, drag, params, maxTime)
     end
     if preferHigh and highLegal and clear(highDir) then return highDir, "high" end
     -- Automatic selection is distance/clearance based, independent of camera
@@ -1362,6 +1396,16 @@ local function getLaunchDirection(startPos, targetPos, targetPart, speed, gravit
     if lowLegal and clear(lowDir) then return lowDir, "low" end
     if highLegal and clear(highDir) then return highDir, "high" end
     if not highLegal and not lowLegal then return nil, "target outside gun elevation" end
+    local function withinLifetime(direction,legal)
+        if not legal then return false end
+        local range=Vector3.new(offset.X,0,offset.Z).Magnitude
+        local horizontal=Vector3.new(direction.X,0,direction.Z).Magnitude*speed
+        local time=ballistics.time(range,horizontal,drag)
+        return time and time <= (maxTime or 60)
+    end
+    if not withinLifetime(lowDir,lowLegal) and not withinLifetime(highDir,highLegal) then
+        return nil,"flight exceeds ammunition lifetime"
+    end
     -- Retain a display-only candidate so an obstruction can shorten the red
     -- preview instead of making it jump to the unrelated bore trajectory.
     return nil, "trajectory blocked", (preferHigh and highLegal and highDir)
@@ -1462,10 +1506,10 @@ local function showTrajectoryBeam(preview, startPos, endPos, startVelocity, endV
     end
     preview.origin.WorldCFrame = tangentFrame(startPos, startVelocity)
     preview.impact.WorldCFrame = tangentFrame(endPos, endVelocity)
-    local distance = (endPos - startPos).Magnitude
-    local handleLimit = math.max(distance * 3, 500)
-    preview.beam.CurveSize0 = math.min(startVelocity.Magnitude * flightTime / 3, handleLimit)
-    preview.beam.CurveSize1 = math.min(endVelocity.Magnitude * flightTime / 3, handleLimit)
+    -- A short-range high lob can have a very tall apex. Distance-based handle
+    -- clamping flattened these otherwise-valid arcs.
+    preview.beam.CurveSize0 = startVelocity.Magnitude * flightTime / 3
+    preview.beam.CurveSize1 = endVelocity.Magnitude * flightTime / 3
     preview.outline.CurveSize0 = preview.beam.CurveSize0
     preview.outline.CurveSize1 = preview.beam.CurveSize1
     preview.outline.Width0 = preview.beam.Width0 + 0.12
@@ -1681,42 +1725,23 @@ end
 -- Follow the same physical path used for the preview, stopping at the first
 -- collidable map hit. Raycasts are batched across a few fine physics steps.
 local function traceTrajectory(startPos, initialVel, gravityY, drag, params, maxSteps, dt)
-    local pos = startPos
-    local vel = initialVel
-    local totalTime = 0
-    local collisionStride = math.max(1, math.ceil(maxSteps / 48))
-    local castStart = pos
-    local castCount = 0
-    local lastCastIndex = 0
-
-    for i = 1, maxSteps do
-        local nextPos
-        if not drag or drag <= 0 then
-            local t = (i * dt)
-            nextPos = startPos + initialVel * t + Vector3.yAxis * (0.5 * gravityY * t * t)
-            vel = initialVel + Vector3.yAxis * (gravityY * t)
-        else
-            vel = vel + Vector3.new(0, gravityY * dt, 0)
-            vel = vel - vel * drag * dt * Vector3.new(1, 0, 1)
-            nextPos = pos + vel * dt
+    local duration = maxSteps * dt
+    local steps = ballistics.steps(duration,gravityY,drag,initialVel.Magnitude)
+    local previous, previousTime = startPos, 0
+    local velocity = initialVel
+    for i = 1, steps do
+        local t = duration*i/steps
+        local point, nextVelocity = ballistics.sample(startPos,initialVel,gravityY,drag,t)
+        local hit = workspace:Raycast(previous,point-previous,params)
+        if hit then
+            local fraction = math.clamp((hit.Position-previous).Magnitude/math.max((point-previous).Magnitude,1e-8),0,1)
+            local impactTime = previousTime+(t-previousTime)*fraction
+            local _, impactVelocity = ballistics.sample(startPos,initialVel,gravityY,drag,impactTime)
+            return hit.Position,hit,impactTime,i,impactVelocity
         end
-        pos = nextPos
-        totalTime = totalTime + dt
-        if i % collisionStride == 0 or i == maxSteps then
-            castCount = castCount + 1
-            local hit = workspace:Raycast(castStart, nextPos - castStart, params)
-            if hit then
-                local castDistance = (nextPos - castStart).Magnitude
-                local fraction = castDistance > 0 and math.clamp((hit.Position - castStart).Magnitude / castDistance, 0, 1) or 1
-                local impactTime = totalTime - (i - lastCastIndex) * dt * (1 - fraction)
-                return hit.Position, hit, impactTime, castCount, vel
-            end
-            castStart = nextPos
-            lastCastIndex = i
-        end
+        previous,previousTime,velocity = point,t,nextVelocity
     end
-
-    return pos, nil, totalTime, castCount, vel
+    return previous,nil,duration,steps,velocity
 end
 
 -- Main Render Loop
@@ -1818,10 +1843,10 @@ RunService:BindToRenderStep(VISUAL_RENDER_NAME, FREECAM_PRIORITY + 2, function()
     local horizontalRange = Vector3.new(predictedTarget.X - startPos.X, 0, predictedTarget.Z - startPos.Z).Magnitude
     local previewVelocity = idealInitialVel or (tankVel + forwardDir * muzzleSpeed)
     local horizontalSpeed = Vector3.new(previewVelocity.X, 0, previewVelocity.Z).Magnitude
-    local flightTime = targetPart and math.clamp(
-        (horizontalRange > 0.1 and horizontalRange / math.max(horizontalSpeed, 1) or estTime) + 0.65,
-        0.7, 60
-    ) or math.clamp(6500 / math.max(muzzleSpeed, 1), 2, 12)
+    local lifetime = ballistics.lifetime(wData.shellData)
+    local targetTime = ballistics.time(horizontalRange,horizontalSpeed,drag)
+    local flightTime = targetPart and math.min(lifetime,math.max(0.1,(targetTime or estTime)+0.65))
+        or math.min(lifetime,math.clamp(6500/math.max(muzzleSpeed,1),2,12))
     if aimCache.arc == "barrel" or previewDirection == nil then
         -- A nearby cursor pixel is only a bearing in artillery mode. Preview
         -- the shell's natural airborne time instead of stopping at that pixel.
@@ -1829,7 +1854,7 @@ RunService:BindToRenderStep(VISUAL_RENDER_NAME, FREECAM_PRIORITY + 2, function()
         -- impact, so its red area can join the physical trajectory endpoint.
         local gravityMagnitude = math.max(math.abs(gravityY), 1)
         local airborneTime = 2 * math.max(previewVelocity.Y, 0) / gravityMagnitude
-        flightTime = math.clamp(math.max(flightTime, airborneTime + 3), 3, 60)
+        flightTime = math.min(lifetime,math.max(flightTime, airborneTime + 3))
     end
     -- Coarse preview integration; the firing aim is calculated separately.
     -- Collision rays still cover each batch of steps to find the impact.
@@ -1871,8 +1896,7 @@ RunService:BindToRenderStep(VISUAL_RENDER_NAME, FREECAM_PRIORITY + 2, function()
         leadEnd, leadHit, leadTime, leadRays, leadEndVel = traceTrajectory(startPos, idealInitialVel, gravityY, drag, rayParams, simSteps, simDt)
         leadDisplayEnd = leadHit and leadEnd or (targetPart and predictedTarget or leadEnd)
         if Settings.Trajectory then
-            local displayTime = leadHit and leadTime or math.max(0.05,
-                horizontalRange / math.max(horizontalSpeed, 1))
+            local displayTime = leadHit and leadTime or math.min(lifetime,math.max(0.05,targetTime or leadTime))
             showTrajectoryBeam(leadPreview, startPos, leadDisplayEnd, idealInitialVel, leadEndVel, displayTime)
         else
             leadPreview.beam.Enabled = false
@@ -2553,21 +2577,18 @@ function shotTracker.attach(entry, state)
     entry.lastPosition, entry.lastMoved = state.position, os.clock()
     local w = entry.weapon
     local duration = math.max(entry.predictedTime or 0, 2 * math.max(entry.initialVelocity.Y, 0) / math.max(math.abs(w.gravity), 1) + 3)
-    duration = math.min(duration, tonumber(state.Lifetime) or 60, 60)
+    duration = math.min(duration,ballistics.lifetime(state))
     local steps = math.clamp(math.ceil(duration / 0.18), 8, 120)
     local finish, hit, time, _, endVelocity = traceTrajectory(entry.start, entry.initialVelocity,
         w.gravity, w.drag, getTrajectoryParams(entry.vehicle), steps, duration / steps)
     entry.expectedTime, entry.expectedEnd, entry.expectedHit = time, finish, hit ~= nil
     -- A full forecast is retained, but completed geometry comes from observed
     -- movement. Pixel-width segments avoid subpixel world-Beam stippling.
-    local p0, p3 = entry.start, finish
-    local p1 = p0 + entry.initialVelocity * (time / 3)
-    local p2 = p3 - endVelocity * (time / 3)
+    local p0 = entry.start
     entry.samples, entry.pathLength = { { point = p0, length = 0 } }, 0
     for i = 1, 48 do
-        local t = i / 48
-        local u = 1 - t
-        local point = p0 * u^3 + p1 * (3*u*u*t) + p2 * (3*u*t*t) + p3 * t^3
+        local point = ballistics.sample(entry.start,entry.initialVelocity,w.gravity,w.drag,time*i/48)
+        if i == 48 then point = finish end
         entry.pathLength = entry.pathLength + (point - entry.samples[#entry.samples].point).Magnitude
         entry.samples[#entry.samples + 1] = { point = point, length = entry.pathLength }
     end
@@ -2868,7 +2889,7 @@ RunService:BindToRenderStep("AutoLeadShotTracking", FREECAM_PRIORITY + 3, functi
                 entry.eta = nil
                 shotTracker.announce(entry, entry.status, "No movement observed; flight visuals removed")
             end
-            if not entry.finished and elapsed > math.clamp(tonumber(state.Lifetime) or 60, 1, 60) + 2 then
+            if not entry.finished and elapsed > ballistics.lifetime(state) + 2 then
                 entry.finished, entry.status = now, "TRACKING ENDED"
                 shotTracker.announce(entry, entry.status, "No impact confirmation")
             end
@@ -2975,7 +2996,8 @@ local function calculateShotDirection(veh, wData, startPos, tankVel, speed, grav
     local minPitch, maxPitch = getTurretPitchLimits(wData and wData.turret)
     local idealLaunchDir, arc, previewDir = getLaunchDirection(startPos, predictedTarget, targetPart, speed,
         gravityY, drag, indirectMode, Settings.AutoBallistic,
-        boreDir, minPitch, maxPitch, getClearanceParams(veh))
+        boreDir, minPitch, maxPitch, getClearanceParams(veh), ballistics.lifetime(wData.shellData),
+        veh.PrimaryPart and veh.PrimaryPart.CFrame.UpVector or Vector3.yAxis)
     if not idealLaunchDir then
         local previewVelocity = previewDir and (previewDir * speed - tankVel)
         return nil, targetPos, targetVel, targetPart, hitNormal, arc,
@@ -2997,58 +3019,88 @@ end
 -- are rejected because they can spawn a projectile through the turret.
 local MIN_BARREL_ALIGNMENT = -0.1
 
--- The game gunner controller consumes this Vector3Value as a world-space
--- turret target. Only borrow it while we own the gunner seat, and yield if
--- another game system writes a different nonzero target.
-local slaveTargetValue, slaveLastValue, slaveLastWrite = nil, nil, 0
-local function releaseArtillerySlave()
-    if slaveTargetValue and slaveTargetValue.Parent and slaveLastValue
-        and (slaveTargetValue.Value - slaveLastValue).Magnitude < 0.01 then
-        slaveTargetValue.Value = Vector3.zero
+-- Native sight commands steer through the game's own rate/limit/damage
+-- controller. No weld writes, remote calls or mouse/camera substitution.
+ballistics.slave = {}
+function ballistics.commandError(bore, desired, up)
+    local flatBore = bore-up*bore:Dot(up)
+    local flatAim = desired-up*desired:Dot(up)
+    local yaw = 0
+    if flatBore.Magnitude > 0.001 and flatAim.Magnitude > 0.001 then
+        yaw = math.atan2(-up:Dot(flatBore.Unit:Cross(flatAim.Unit)),
+            math.clamp(flatBore.Unit:Dot(flatAim.Unit),-1,1))
     end
-    slaveTargetValue, slaveLastValue, slaveLastWrite = nil, nil, 0
+    local pitch = math.asin(math.clamp(desired:Dot(up),-1,1))
+        - math.asin(math.clamp(bore:Dot(up),-1,1))
+    local cap = math.rad(12) -- Per-command bound, NOT a solver elevation limit.
+    return Vector2.new(math.clamp(yaw,-cap,cap),math.clamp(-pitch,-cap,cap))
+end
+local function releaseArtillerySlave(preserveFailure)
+    local state = ballistics.slave
+    if state.value and state.value.Parent and state.last
+        and state.value.Value == state.last and state.value:GetAttribute("type") == "none" then
+        state.value.Value = Vector3.zero
+        state.value:SetAttribute("type",state.originalType)
+    end
+    local stalled, reason = state.stalled, state.reason
+    table.clear(state)
+    if preserveFailure then state.stalled, state.reason = stalled, reason end
 end
 local function updateArtillerySlave(wData, startPos, direction, arc)
+    local state = ballistics.slave
     local hum = lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
     local seat = hum and hum.SeatPart
     local control = wData and wData.turret and wData.turret:FindFirstChild("Control")
-    local shouldSlave = Settings.Freecam and freecamActive and wData and wData.weapon
-        and wData.weapon:GetAttribute("ARTY") == true and control and control.Value == seat
-        and seat ~= nil and direction ~= nil and (arc == "high" or arc == "low")
+    local shouldSlave = Settings.ArtilleryAutoLay and Settings.EnableAutoLead
+        and (Settings.AutoLead or Settings.AutoBallistic)
+        and Settings.Freecam and freecamActive and wData and wData.weapon
+        and (wData.weapon:GetAttribute("ARTY") == true or Settings.AutoBallistic)
+        and control and control.Value == seat and seat ~= nil
+        and direction ~= nil and (arc == "high" or arc == "low")
     if not shouldSlave then releaseArtillerySlave(); return false end
-
-    local infoObject = wData.turret:FindFirstChild("TurretInfo")
-    local infoOk, turretInfo = pcall(require, infoObject)
-    if not infoOk or not turretInfo or not turretInfo.FCS then
-        -- Legacy guns do not read TargetPos. Avoid direct weld manipulation:
-        -- it is not validated against their normal controller or replication.
-        releaseArtillerySlave()
-        return false
+    if state.stalled then
+        if state.stalled:Dot(direction) > math.cos(math.rad(3)) then return false end
+        state.stalled = nil
     end
-
     local ngd = game:GetService("ReplicatedFirst"):FindFirstChild("NewGuiData")
     local gunner = ngd and ngd:FindFirstChild("Gunner")
-    local weapons = gunner and gunner:FindFirstChild("Weapons")
-    local data = weapons and weapons:FindFirstChild("Data")
-    local targetValue = data and data:FindFirstChild("TargetPos")
-    if not targetValue or not targetValue:IsA("Vector3Value") then
-        releaseArtillerySlave()
+    local data = gunner and gunner:FindFirstChild("Data")
+    local command = data and data:FindFirstChild("CmdAngle")
+    if not command or not command:IsA("Vector3Value") then
+        releaseArtillerySlave(); state.reason = "native angle command unavailable"; return false
+    end
+    if state.value and (state.value ~= command or state.weapon ~= wData.weapon) then releaseArtillerySlave() end
+    if (state.last and (command.Value ~= state.last or command:GetAttribute("type") ~= "none"))
+        or (not state.last and Vector2.new(command.Value.X,command.Value.Y).Magnitude > 0.0001) then
+        releaseArtillerySlave(); state.reason = "another sight control owns aim"; return false
+    end
+    local bore = getBoreForwardDirection(wData)
+    local root = wData.vehicle and wData.vehicle.PrimaryPart
+    local error = math.deg(math.acos(math.clamp(bore:Dot(direction),-1,1)))
+    local now = os.clock()
+    if not state.direction or state.direction:Dot(direction) < math.cos(math.rad(3))
+        or error < (state.bestError or math.huge)-0.05 then
+        state.progressAt, state.bestError = now,error
+    end
+    if error > 3 and now-(state.progressAt or now) > 3 then
+        state.stalled, state.reason = direction,"native aim not responding; enable gunner optic or aim manually"
+        releaseArtillerySlave(true)
         return false
     end
-    if slaveTargetValue and slaveTargetValue ~= targetValue then releaseArtillerySlave() end
-    if targetValue.Value.Magnitude > 0.01
-        and (not slaveLastValue or (targetValue.Value - slaveLastValue).Magnitude > 0.01) then
-        releaseArtillerySlave()
-        return false
+    state.direction = direction
+    if now-(state.writeAt or -1) >= 0.05 then
+        local delta = error <= 0.15 and Vector2.zero
+            or ballistics.commandError(bore,direction,root and root.CFrame.UpVector or Vector3.yAxis)
+        if not state.value then state.originalType = command:GetAttribute("type") end
+        state.value = command
+        state.weapon = wData.weapon
+        command:SetAttribute("type","none")
+        state.last = Vector3.new(delta.X,delta.Y,now)
+        command.Value = state.last
+        state.writeAt = now
     end
-    local virtualTarget = startPos + direction * 4000
-    if not slaveLastValue or (virtualTarget - slaveLastValue).Magnitude > 2 then
-        if os.clock() - slaveLastWrite >= 0.05 then
-            targetValue.Value = virtualTarget
-            slaveTargetValue, slaveLastValue, slaveLastWrite = targetValue, virtualTarget, os.clock()
-        end
-    end
-    return slaveTargetValue == targetValue
+    state.reason = error <= 3 and "aligned" or "native angle command pending"
+    return true
 end
 
 -- MTC calls FireBullet from a restricted game-script thread. Resolve all
@@ -3099,12 +3151,17 @@ refreshAimCache = function()
         aimCache.turretSlaveActive = updateArtillerySlave(weapon, startPos, direction, arc)
         -- Low-arc correction has the same bearing guard in either camera.
         -- Only a selected high lob requires precise barrel alignment.
-        local slewing = arc == "high" and direction ~= nil
+        local slewing = (arc == "high" or aimCache.turretSlaveActive) and direction ~= nil
             and aimCache.alignment < math.cos(math.rad(3))
+        aimCache.waitForAlignment = slewing
+        if slewing and not aimCache.fireBlock then
+            aimCache.fireBlock = not aimCache.turretSlaveActive and ballistics.slave.reason
+                or "Waiting for barrel azimuth/elevation alignment"
+        end
         aimCache.clearance = direction ~= nil and not slewing
         local unsafe = aimCache.alignment < MIN_BARREL_ALIGNMENT
         aimCache.reason = not direction and arc or slewing and
-            (aimCache.turretSlaveActive and "turret slewing to target arc" or "aim barrel to target arc")
+            (aimCache.turretSlaveActive and "turret slewing to target arc" or ballistics.slave.reason or "aim barrel to target arc")
             or unsafe and "turn barrel toward cursor" or "ready"
         if aimCache.fireBlock then aimCache.reason = aimCache.fireBlock end
         local hint = not direction and arc or slewing and
@@ -3557,6 +3614,12 @@ local function installHooks()
             hookedWeaponHandler = wh
 
             wh.fireWeapon = function(p56, p57, u58, p59, p60, p61, p62, p63)
+                if Settings.EnableAutoLead and (Settings.AutoLead or Settings.AutoBallistic)
+                    and aimCache.vehicle == p59 and aimCache.weapon and aimCache.weapon.weapon == u58
+                    and aimCache.waitForAlignment then
+                    shotTracker.reject("Waiting for barrel azimuth/elevation alignment")
+                    return false
+                end
                 local held = heldFire.matches(p59, u58)
                 if held and (heldFire.busy or os.clock() < heldFire.nextAllowed) then return false end
                 if held then heldFire.busy = true end
@@ -3678,6 +3741,8 @@ _G.AutoLeadAssistDiagnostics = function()
         weapon = weapon and weapon.weaponName or "none",
         loaded = weapon and weapon.loaded or "none",
         freecam = freecamActive,
+        artilleryControl = { enabled = Settings.ArtilleryAutoLay, reason = ballistics.slave.reason,
+            commandOwned = ballistics.slave.value ~= nil, waitingForAlignment = aimCache.waitForAlignment == true },
         clickTeleport = Settings.FreecamClickTP,
         heldFire = { active = next(heldFire.inputs) ~= nil, busy = heldFire.busy == true },
         autoLead = Settings.AutoLead,

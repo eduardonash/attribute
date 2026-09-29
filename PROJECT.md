@@ -2,6 +2,18 @@
 
 ## 1. Overview
 
+### Artillery solver and native auto-elevation revision (2026-09-28)
+
+The pre-revision source already had both quadratic roots, collision-based high-arc fallback and full `TurretInfo.anglelimits.vertical` searches; the reported minus-root-only / ±8° assumptions did not describe this version. This revision addresses remaining inconsistencies:
+
+- Rationalized the low root for numerical stability, checked vertical apex reachability, and replaced the dragged-root angle grid with peak bracketing and bisection. Physical low/high roots are identified before mechanical filtering, so a lone legal high root is not mislabeled low. Elevation legality uses the vehicle's up vector rather than assuming a level hull.
+- Shared one continuous horizontal-drag sampler between solver clearance and trajectory tracing. Flight-time estimates now include horizontal drag; collision sampling is curvature-aware and bounded to 8–192 rays. The ammunition's `Lifetime` limits the forecast (60 seconds when unavailable, 120-second safety ceiling); this does not extend real projectile lifetime. The continuous model is an approximation to variable-step native simulation, not a guarantee of exact native impacts.
+- Removed the distance-based Beam tangent cap that flattened tall, short-range high arcs. Flight-progress samples also use the shared model; no-drag Beam curves are analytic, while dragged Beam curves remain a cubic approximation between matching endpoints/tangents.
+- **Aim → Assist → Freecam Artillery Auto-Elevation** (default on) uses `NewGuiData.Gunner.Data.CmdAngle`, verified in current TurretsNew/SightModule source, instead of FCS-only TargetPos or direct weld mutation. It commands azimuth and elevation in bounded increments while the matching gunner seat owns the turret, preserving native traverse, mechanical/damage limits and replication. The command bound is not a solver pitch limit. Some native modes consume these commands only with the gunner optic active: enter the optic before enabling freecam. No response for three seconds cancels the command and reports manual/optic guidance; retoggle freecam/auto-elevation or choose a different bearing to retry. Another command writer causes the assist to yield. This adapter has not yet been verified moving a live gun.
+- High arcs and actively auto-laid shots wait for actual barrel alignment within 3°. The weapon handler and direct-fire path reject these pending shots instead of firing along a misleading bore path. Driver-seat firing does not grant gunner turret control. Arc, readiness and native command ownership/status remain separate diagnostics.
+
+Verification: full source compiled without execution. Eighteen isolated solver/trace assertions and ten command-controller assertions passed, including obstacle fallback, full-range high-root preference, limits/lifetime, a 94.9-second high arc, dragged endpoint error below 0.0001 stud in the shared model, command signs/rate limiting, alignment feedback, seat exit, external ownership and stalled-input cleanup. No full script reload, real turret movement or shot was performed. Live native-control and impact verification remain pending; this revision is not proof of universal artillery compatibility.
+
 ### Tank alignment and outline-only correction (2026-09-27)
 
 **ESP → Tank Modules → Outline Thickness** now controls module lines from 1–5 pixels in whole-pixel steps. Defaults to 1 pixel and remembers the choice across script reloads in the same client session. Changes apply to existing lines on the next render frame without rebuilding them. Lines retain 55% opacity and no dark border; tank Highlight and box thickness are unchanged.
@@ -61,12 +73,12 @@ flowchart TD
    - For a finite target in normal auto-lead mode, uses the minus-sign (lower-angle) no-drag ballistic root:
      $$\tan(\theta) = \frac{v^2 \pm \sqrt{v^4 - g_{\text{mag}}(g_{\text{mag}} x^2 + 2 y v^2)}}{g_{\text{mag}} x}$$
    - Auto-lead uses the same automatic arc selection in normal view and freecam: choose a legal, clear low root first, then a legal, clear high root if the low path is blocked. `AutoBallistic` explicitly prefers a clear high root. Distance alone does not force a high arc or extend maximum range. With horizontal drag, the solver searches the legal elevation interval numerically. A blocked path, unreachable elevation, or out-of-range target is reported.
-   - When the player occupies the matching gunner seat, freecam artillery can feed the chosen direction to an FCS-equipped turret through the game's `Gunner.Weapons.Data.TargetPos` control. It yields to another nonzero target owner and clears its own value on exit or unload. Guns without FCS—including the tested 2S19 and M109—are not automatically slewed. High-arc assistance requires the barrel within about 3° of the chosen direction in either camera mode. Low-arc correction uses the same forward-bearing guard in both modes.
+   - Freecam artillery auto-elevation feeds angular error into the native `CmdAngle` sight input while the matching gunner seat owns the turret. It is not restricted to FCS metadata, but the native optic/control mode must consume that input. It yields to another owner or stalled control and clears its own command on exit/unload. High arcs and auto-laid shots require actual barrel alignment within about 3° before assisted firing.
    - An unreachable finite target has no assisted solution; there is **no automatic 45-degree fallback**. Open sky preserves the barrel elevation and uses the cursor bearing. Direct firing falls back to the actual bore when assistance is unavailable, matching native gunner fire. Near-backward assisted directions are rejected.
 
 4. **Collision-aware trajectory trace (`traceTrajectory`)**
-   - For shells without drag, uses the analytic parabolic position at each preview sample to avoid integration drift. Dragged shells retain stepwise integration. Raycasts are batched across the path using the `Projectile` collision group where available.
-   - The preview now updates on rendered frames after the freecam camera step. It reuses raycast settings and skips unchanged traces for up to 0.2 seconds; cursor, barrel, or target movement invalidates that cache immediately. It uses 8–120 simulation steps and can look ahead up to 60 seconds in barrel-lob mode.
+   - Both no-drag and dragged previews use the same analytic sampler as clearance selection (parabolic vertical motion and continuous exponential horizontal drag). Collision samples use the `Projectile` group where available.
+   - The preview updates after freecam/zoom. It reuses raycast settings and skips unchanged traces for up to 0.2 seconds; cursor, barrel or target movement invalidates the cache. Curvature-aware tracing uses 8–192 samples, bounded by the ammunition lifetime and a 120-second safety ceiling.
    - It stops at the first raycast hit, including queryable map colliders. A planned path can remain visible without an impact in the preview window; the HUD and red impact cue distinguish that case from a confirmed hit.
    - The displayed beam is a cubic approximation between the simulated launch and endpoint, not a guarantee of the server projectile's full path.
 
@@ -93,7 +105,7 @@ flowchart TD
 - $y = \Delta Y$
 - $v = \text{MuzzleSpeed}$ (studs/s)
 - $g$ comes from the shell or MTC constants when available; the fallback is $-49\text{ studs/s}^2$.
-- The closed-form root ignores drag; indirect aim with dragged shells uses a bounded numeric pitch search. The dragged-shell preview applies horizontal drag with $\vec v_{t+\Delta t}=\vec v_t+(0,g,0)\Delta t-d\Delta t(v_x,0,v_z)$ and $\vec p_{t+\Delta t}=\vec p_t+\vec v_{t+\Delta t}\Delta t$.
+- The closed-form root ignores drag; indirect aim with dragged shells uses bounded peak bracketing and bisection. Clearance and preview share $p_{xz}(t)=p_{xz}(0)+v_{xz}(0)(1-e^{-dt})/d$ and $y(t)=y(0)+v_y(0)t+gt^2/2$, using the linear no-drag limit when $d$ is near zero. Native variable-step integration can differ slightly from this continuous model.
 
 ### Blast-radius estimate and compact cue
 
@@ -171,7 +183,7 @@ Impact and shot-readout labels use bright text with a dark stroke over a faint d
 
 ## 6. Firing and limitations
 
-The firing hook updates replicated shot directions from a frame-synchronized aim cache when alignment is safe. Camera mode does not change the arc-selection or firing gates. High lobs still need barrel alignment; if assistance is unavailable, direct fire preserves the bore direction instead of rejecting the input. The preview labels an unavailable assisted target red. Driver-seat direct fire remains conditional on a valid shot code already observed for the **same vehicle**. It does not automatically grant a gunner role or provide the driver's turret-slaving input. Server-side ammunition and firing rules remain authoritative.
+The firing hook updates replicated shot directions from a frame-synchronized aim cache when alignment is safe. High lobs and actively auto-laid shots are held until the barrel aligns; unavailable solutions otherwise retain the normal bore fallback. The preview labels an unavailable assisted target red. Driver-seat direct fire remains conditional on a valid shot code already observed for the **same vehicle**. It does not automatically grant a gunner role or provide the driver's turret-slaving input. Server-side ammunition and firing rules remain authoritative.
 
 The preview deliberately honors terrain and map collider hits. A line ending before the cursor can therefore mean the predicted projectile hit an obstruction. When no legal path exists to a finite target, the red cue remains at the requested target and no valid assisted trajectory is drawn; it is not a predicted impact. The script cannot promise that a projectile passes through buildings or terrain.
 
