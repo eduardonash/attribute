@@ -470,15 +470,21 @@ check(attributeDisconnects==36,"idle and active hook-replacement cleanup disconn
 local publicationTime=1
 local os={clock=function()return publicationTime end}
 local ReplicatedStorage,getactors,run_on_actor
+local transportTick
+local RunService={Heartbeat={Connect=function(_,callback)
+    transportTick=callback;return {Disconnect=function()end}
+end}}
 ]]..section('shellRedirection.attributes =', 'function shellRedirection.update(')
-        ..section('function shellRedirection.update(', 'function shellRedirection.assign(')..[[
+        ..section('function shellRedirection.update(', 'function shellRedirection.assign(')
+        ..section('shellRedirection.tick=RunService.Heartbeat:Connect(', 'heldFire.tick = RunService.Heartbeat:Connect(')..[[
 local threads={}
 local installedActors={}
+local actorAttributeReads,actorInventoryReads=0,0
 for i=1,2 do
     local values={}
     local signals={}
     installedActors[i]={Name=tostring(i),Parent=threads,IsA=function(_,class)return class=="Actor" end,
-        GetAttribute=function(_,key)return values[key]end,SetAttribute=function(_,key,value)
+        GetAttribute=function(_,key)actorAttributeReads+=1;return values[key]end,SetAttribute=function(_,key,value)
             if values[key]==value then return end
             values[key]=value
             for _,connection in ipairs(signals[key] or {})do if connection.callback then connection.callback()end end
@@ -493,7 +499,7 @@ end
 ReplicatedStorage={FindFirstChild=function(_,name)
     if name=="PHRST" then return {FindFirstChild=function(_,key)if key=="Threads" then return threads end end} end
 end}
-getactors=function()return installedActors end
+getactors=function()actorInventoryReads+=1;return installedActors end
 local startupCalls=0
 run_on_actor=function(installed,source)
     startupCalls+=1
@@ -516,9 +522,57 @@ firstInstalledActor:SetAttribute("AttributeShellRedirectActive","other-owner")
 check(not next(shellRedirection.activeActors),"host ignores another owner's Actor activity signal")
 firstInstalledActor:SetAttribute("AttributeShellRedirectActive",shellRedirection.owner)
 check(shellRedirection.activeActors[firstInstalledActor],"host observes native own Actor activity without focus polling")
-shellRedirection.stop()
+shellRedirection.held=true;shellRedirection.heldKey=Settings.ShellFocusKey
+shellRedirection.focused=actorTarget.player;shellRedirection.focusedRecord=actorTarget
+local pauseKey=shellRedirection.heldKey
+shellRedirection.setTransportPaused(true)
+check(shellRedirection.transportPaused and not shellRedirection.active and shellRedirection.ready==0,
+    "transport pause stops an installed Actor transport")
+check(Settings.ShellRedirection and shellRedirection.held and shellRedirection.heldKey==pauseKey,
+    "transport pause preserves the feature toggle and locally held lock key")
 firstInstalledActor:SetAttribute("AttributeShellRedirectActive",nil)
 check(not shellRedirection.actorConnections and not shellRedirection.activeActors,"host stop releases owned activity subscriptions")
+local function countAttributeWrites()
+    local count=0;for _,value in pairs(attributeWrites)do count+=value end;return count
+end
+local pausedReads,pausedWrites=attributeReads,countAttributeWrites()
+local pausedActorReads,pausedInventoryReads=actorAttributeReads,actorInventoryReads
+local pausedInstalls=startupCalls
+local pausedProfileCount=shellRedirection.performance.transport.count+shellRedirection.performance.installation.count
+for i=1,120 do
+    publicationTime+=1/120
+    shellRedirection.update();transportTick()
+end
+shellRedirection.setTransportPaused(true)
+check(attributeReads==pausedReads and countAttributeWrites()==pausedWrites,
+    "paused updates and repeated pause perform zero player attribute reads or writes")
+check(actorAttributeReads==pausedActorReads and actorInventoryReads==pausedInventoryReads and startupCalls==pausedInstalls,
+    "paused updates perform zero Actor reads, inventory calls or installations")
+check(shellRedirection.performance.transport.count+shellRedirection.performance.installation.count==pausedProfileCount,
+    "paused heartbeat callback performs no transport or installation profiling")
+check(shellRedirection.isEngaged(),"local focus remains engageable while only Actor transport is paused")
+shellRedirection.setTransportPaused(false)
+check(not shellRedirection.transportPaused and Settings.ShellRedirection and shellRedirection.held,
+    "resuming transport does not change the feature or held input")
+shellRedirection.update()
+check(startupCalls==pausedInstalls+2 and shellRedirection.active and shellRedirection.ready==2,
+    "next update reversibly reinstalls transport after diagnostic pause")
+shellRedirection.stop()
+local normalDispatch=run_on_actor
+local interruptedOwner=attrs.AttributeShellRedirectOwner
+local interruptedWrites
+run_on_actor=function(installed,dispatchSource)
+    normalDispatch(installed,dispatchSource)
+    shellRedirection.setTransportPaused(true)
+    interruptedWrites=countAttributeWrites()
+end
+shellRedirection.update()
+check(shellRedirection.transportPaused and not shellRedirection.active and shellRedirection.ready==0
+    and not shellRedirection.actorConnections and attrs.AttributeShellRedirectOwner==interruptedOwner,
+    "pause arriving during Actor installation retains cleanup and restored ownership")
+check(countAttributeWrites()==interruptedWrites,
+    "interrupted Actor installation never resumes attribute publication after diagnostic pause")
+run_on_actor=normalDispatch;shellRedirection.setTransportPaused(false)
 publicationTime=1
 shellRedirection.active=true;shellRedirection.owner="fixture"
 shellRedirection.actors={actor};shellRedirection.ready=1;shellRedirection.installAt=1

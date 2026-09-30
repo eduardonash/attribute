@@ -709,6 +709,21 @@ do
                 Name = "Barrel Safety",
                 Content = "Near-backward shot directions are blocked. Freecam always aims with the mouse."
             })
+            local focusDiagnostics = aimTab:Section({ Name = "Performance Diagnostics", Side = 1 })
+            focusDiagnostics:Toggle({
+                Name = "Native Profiler Scopes (Test)", Flag = "ALA_FocusProfilerTest", Default = false,
+                Callback = function(enabled)
+                    if _G.AutoLeadAssistSetFocusProfiler then _G.AutoLeadAssistSetFocusProfiler(enabled) end
+                end
+            })
+            focusDiagnostics:Toggle({
+                Name = "Pause Steering Transport (Test)", Flag = "ALA_FocusTransportTest", Default = false,
+                Callback = function(paused)
+                    if _G.AutoLeadAssistSetFocusTransportPaused then _G.AutoLeadAssistSetFocusTransportPaused(paused) end
+                end
+            })
+            focusDiagnostics:Paragraph({ Name = "Controlled comparison", Content =
+                "Both tests default off each load. Keep native scopes off for normal play. Transport pause removes owned steering hooks but keeps local lock-on and visuals; do not fire during that comparison." })
 
             local trajectoryTab = window:Tab({ Name = "Trajectory", Columns = 2 })
             local path = trajectoryTab:Section({ Name = "Path", Side = 1 })
@@ -1218,6 +1233,8 @@ end
 local shellRedirection = { players = {}, records = {}, candidates = {}, focused = nil, held = false,
     focusScans = 0, focusRays = 0, visualWrites = 0 }
 shellRedirection.performance = {
+    nativeScopes={enabled=false,unsupported=false,calls=0,failures=0},
+    state={build="opt-in-profiler-isolation",transportPaused=false,activeActors=0,flightActive=false,publicationWrites=0},
     acquisition={name="AutoLead_Acquisition",count=0,totalMs=0,lastMs=0,maxMs=0,over5Ms=0,over50Ms=0},
     frame={name="AutoLead_FocusFrame",count=0,totalMs=0,lastMs=0,maxMs=0,over5Ms=0,over50Ms=0},
     transport={name="AutoLead_Transport",count=0,totalMs=0,lastMs=0,maxMs=0,over5Ms=0,over50Ms=0},
@@ -1227,20 +1244,51 @@ shellRedirection.performance = {
         heldEmpty={count=0,totalMs=0,maxMs=0,over25Ms=0,over50Ms=0},
         heldTarget={count=0,totalMs=0,maxMs=0,over25Ms=0,over50Ms=0}}
 }
+function shellRedirection.setProfiler(enabled)
+    local scopes=shellRedirection.performance.nativeScopes
+    scopes.enabled=enabled==true
+    -- An explicit opt-in is the only retry after an unavailable/throwing API.
+    if scopes.enabled then scopes.unsupported=false;scopes.error=nil end
+    return scopes.enabled
+end
+function shellRedirection.profilerUnavailable(message)
+    local scopes=shellRedirection.performance.nativeScopes
+    scopes.enabled=false;scopes.unsupported=true;scopes.failures+=1
+    scopes.error=tostring(message)
+end
 function shellRedirection.profileBegin(stage)
+    local started=os.clock()
     local bucket=shellRedirection.performance[stage]
     bucket.marked=false
+    bucket.close=nil
+    local scopes=shellRedirection.performance.nativeScopes
     -- Executor installation can yield. Time it separately without leaving a
-    -- native profiler marker open across that operation.
-    if stage~="installation" and debug and type(debug.profilebegin)=="function" and type(debug.profileend)=="function" then
-        bucket.marked=pcall(debug.profilebegin,bucket.name)
+    -- native profiler marker open across that operation. Native scopes are
+    -- opt-in: numeric telemetry must not continually call unsupported APIs.
+    if stage~="installation" and scopes.enabled and not scopes.unsupported then
+        if debug and type(debug.profilebegin)=="function" and type(debug.profileend)=="function" then
+            scopes.calls+=1
+            local ok,err=pcall(debug.profilebegin,bucket.name)
+            bucket.marked=ok
+            if ok then bucket.close=debug.profileend
+            else shellRedirection.profilerUnavailable(err) end
+        else
+            shellRedirection.profilerUnavailable("Native profiler APIs unavailable")
+        end
     end
-    return os.clock()
+    return started
 end
 function shellRedirection.profileEnd(stage,started)
     local bucket=shellRedirection.performance[stage]
+    if bucket.marked then
+        local scopes=shellRedirection.performance.nativeScopes
+        scopes.calls+=1
+        local ok,err=pcall(bucket.close)
+        bucket.marked=false;bucket.close=nil
+        if not ok then shellRedirection.profilerUnavailable(err) end
+    end
+    -- Include both marker calls, including a caught failure, in scope timing.
     local elapsed=(os.clock()-started)*1000
-    if bucket.marked then pcall(debug.profileend);bucket.marked=false end
     bucket.count+=1;bucket.totalMs+=elapsed;bucket.lastMs=elapsed
     bucket.meanMs=bucket.totalMs/bucket.count
     bucket.maxMs=math.max(bucket.maxMs,elapsed)
@@ -1248,6 +1296,15 @@ function shellRedirection.profileEnd(stage,started)
     if elapsed>50 then bucket.over50Ms+=1 end
 end
 function shellRedirection.recordInterval(now)
+    local state=shellRedirection.performance.state
+    state.held=shellRedirection.held==true
+    state.engaged=shellRedirection.isEngaged()==true
+    state.focusedPlayer=shellRedirection.focused and shellRedirection.focused.Name or nil
+    state.flightActive=shellRedirection.flightActive==true
+    state.activeActors=shellRedirection.activeActorCount or 0
+    state.publicationWrites=shellRedirection.publicationWrites or 0
+    state.transportPaused=shellRedirection.transportPaused==true
+    state.readyActors=shellRedirection.ready or 0
     local stats=shellRedirection.performance.intervals
     local previous=shellRedirection.previousFrameTime
     shellRedirection.previousFrameTime=now
@@ -1656,6 +1713,7 @@ shellRedirection.attributes = {"AttributeShellRedirectOwner","AttributeShellRedi
 function shellRedirection.stop()
     for _,connection in ipairs(shellRedirection.actorConnections or {}) do connection:Disconnect() end
     shellRedirection.actorConnections=nil;shellRedirection.activeActors=nil;shellRedirection.launchWakeUntil=nil
+    shellRedirection.activeActorCount=0
     shellRedirection.flightActive,shellRedirection.publishedHeld,shellRedirection.publishedTargetId=false,nil,nil
     if shellRedirection.originalAttributes and lp:GetAttribute("AttributeShellRedirectOwner")==shellRedirection.owner then
         for _, key in ipairs(shellRedirection.attributes) do
@@ -1666,7 +1724,19 @@ function shellRedirection.stop()
     shellRedirection.ready = 0
     shellRedirection.originalAttributes = nil
 end
+function shellRedirection.setTransportPaused(paused)
+    shellRedirection.transportPaused=paused==true
+    shellRedirection.performance.state.transportPaused=shellRedirection.transportPaused
+    -- Only owned transport/hooks are removed. Local held input, targeting and
+    -- focus visuals continue, allowing a transport-only A/B comparison.
+    if shellRedirection.transportPaused and shellRedirection.active then shellRedirection.stop() end
+    return shellRedirection.transportPaused
+end
 function shellRedirection.update()
+    if shellRedirection.transportPaused then
+        if shellRedirection.active then shellRedirection.stop() end
+        return
+    end
     if not Settings.ShellRedirection then
         if shellRedirection.active then shellRedirection.stop() end
         shellRedirection.failed, shellRedirection.error = nil,nil
@@ -1690,6 +1760,7 @@ function shellRedirection.update()
         lp:SetAttribute("AttributeShellRedirectHeartbeat",now)
         shellRedirection.active, shellRedirection.actors = true,{}
         shellRedirection.activeActors,shellRedirection.actorConnections={},{}
+        shellRedirection.activeActorCount=0
         shellRedirection.installAt = now
         local ok,err = pcall(function()
             local phrst = ReplicatedStorage:FindFirstChild("PHRST")
@@ -1700,12 +1771,20 @@ function shellRedirection.update()
                         :gsub("@OWNER@",function() return string.format("%q",shellRedirection.owner) end)
                         :gsub("@STEER@",function() return shellRedirection.steerSource end)
                     local installed = pcall(run_on_actor,actor,code)
+                    -- Pause/unload can restore ownership while this executor
+                    -- call yields. Never register listeners into stopped state.
+                    if shellRedirection.transportPaused or shellRedirection.destroyed then return end
                     if installed then
                         shellRedirection.actors[#shellRedirection.actors+1]=actor
                         local installedOwner=shellRedirection.owner
                         local function activityChanged()
                             if shellRedirection.active and shellRedirection.owner==installedOwner then
-                                shellRedirection.activeActors[actor]=actor:GetAttribute("AttributeShellRedirectActive")==installedOwner or nil
+                                local wasActive=shellRedirection.activeActors[actor]==true
+                                local isActive=actor:GetAttribute("AttributeShellRedirectActive")==installedOwner
+                                shellRedirection.activeActors[actor]=isActive or nil
+                                if wasActive~=isActive then
+                                    shellRedirection.activeActorCount+=isActive and 1 or -1
+                                end
                             end
                         end
                         shellRedirection.actorConnections[#shellRedirection.actorConnections+1]=
@@ -1715,6 +1794,12 @@ function shellRedirection.update()
                 end
             end
         end)
+        -- Installation may yield; a diagnostic pause/unload can arrive while
+        -- executor work is pending. Do not publish or resume that transport.
+        if shellRedirection.transportPaused or shellRedirection.destroyed then
+            shellRedirection.stop()
+            return
+        end
         if not ok or #shellRedirection.actors==0 then
             shellRedirection.error = not ok and tostring(err) or "No accessible projectile Actor"
             shellRedirection.failed = true
@@ -2715,6 +2800,7 @@ local playerDrawings = {}
 local tankHighlights = {}
 local espStats = { players = 0, tanks = 0 }
 espStats.timings = { frameMs=0, playerDrawMs=0, tankDrawMs=0, playerScanMs=0, tankScanMs=0, armorScanMs=0 }
+shellRedirection.performance.esp=espStats.timings
 -- WorldToViewportPoint pixels must not receive the top-bar/safe-area inset.
 -- Keep this separate so the existing impact HUD layout is unchanged.
 espStats.gui = Instance.new("ScreenGui")
@@ -3682,6 +3768,8 @@ RunService:BindToRenderStep("AutoLeadShotTracking", FREECAM_PRIORITY + 3, functi
     end
     -- Flight ETA stays at the target. Dispatch notifications use VibeUI,
     -- rather than another persistent shot-status panel over the scene.
+    shellRedirection.performance.state.trackedShells=#shotTracker.entries
+    shellRedirection.performance.state.dispatchedShots=shotTracker.serial
 end)
 local fireReadiness = { time = 0 }
 
@@ -4504,6 +4592,8 @@ end
 
 -- Timing-only read: no target raycast, Instance traversal or table allocation.
 _G.AutoLeadAssistFocusTelemetry = function() return shellRedirection.performance end
+_G.AutoLeadAssistSetFocusProfiler = shellRedirection.setProfiler
+_G.AutoLeadAssistSetFocusTransportPaused = shellRedirection.setTransportPaused
 
 _G.AutoLeadAssistDiagnostics = function()
     local activeActorCount=0
@@ -4712,6 +4802,7 @@ shellRedirection.ended=UserInputService.InputEnded:Connect(shellRedirection.inpu
 shellRedirection.focusLost=UserInputService.WindowFocusReleased:Connect(shellRedirection.release)
 shellRedirection.tick=RunService.Heartbeat:Connect(function()
     -- Never fan out Actor state from the camera/render callback.
+    if shellRedirection.transportPaused then return end
     if not Settings.ShellRedirection and not shellRedirection.active and not shellRedirection.failed then return end
     if shellRedirection.transportBusy then return end
     shellRedirection.transportBusy=true
@@ -4805,6 +4896,8 @@ _G.AutoLeadAssistUnload = function()
     firingShake.restoreSink()
     _G.AutoLeadAssistDiagnostics = nil
     _G.AutoLeadAssistFocusTelemetry = nil
+    _G.AutoLeadAssistSetFocusProfiler = nil
+    _G.AutoLeadAssistSetFocusTransportPaused = nil
     _G.AutoLeadAssistSetFreecam = nil
     _G.AutoLeadAssistSetZoom = nil
 end
