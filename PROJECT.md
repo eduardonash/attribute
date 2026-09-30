@@ -2,7 +2,21 @@
 
 ## 1. Overview
 
+### Freecam input ownership and Actor startup lease (2026-09-29)
+
+The latest identity-only transport was confirmed running, but the inspected client had already stopped redirection with `Projectile Actors did not confirm steering access`, zero ready Actors and no ownership/status attributes. Freecam was active, zoom was off, and there were no tracked shells. This snapshot cannot establish that active shell steering caused the remaining stutter. The client then reconnected into a new session without the script loaded, preventing a controlled live comparison.
+
+Two concrete bugs were corrected. RMB previously both held focus and locked/recentered/rotated the freecam. When Shell Redirection is enabled with RMB as its lock key, freecam now leaves the cursor free and does not apply RMB mouse-look. Arrow keys still rotate the camera; choosing a keyboard lock key or disabling redirection restores ordinary RMB look. `shellRedirection.freecamRmbOwner` reports that ownership, and the UI explains the controls.
+
+Serial Actor installation also used a stale frame-entry heartbeat, so setup lasting more than 0.75 seconds could make installed Actors restore themselves before readiness was confirmed. The host now publishes `Initializing`, refreshes its clock/heartbeat/confirmation timeout after all installation calls, then clears the setup flag. Actors allow at most eight seconds of setup grace, cannot steer during setup, and retain the strict 0.75-second running lease afterward. Ownership loss and unload still restore only owned hooks/attributes and disconnect all six listeners. The normal idle transport/sampling rate is unchanged.
+
+`esp.timings` adds last measured player/tank drawing and roster/tank/armor scan durations, plus the complete ESP callback duration, in milliseconds. These are callback CPU timings, not GPU cost or proof that the observed screen hitch is fixed; scan values retain the last actual scan. Existing focus/update and frame-interval diagnostics remain available for a controlled follow-up.
+
+Verification: full source compiled locally without execution; **181 assertions passed** (53 adaptive/native-fire, 121 redirection/transport/startup, 7 freecam input ownership). Tests cover delayed installation, fresh completion heartbeat, strict and abandoned-startup lease cleanup, no setup steering and exclusive RMB ownership. The Roblox inspection skill provided read-only live evidence and guided the distinction between cursor/input conflict and actual frame stalls. No full live reload or shot was performed. The remaining reported lag needs user retest; neither these tests nor the inspected failed runtime prove its full cause resolved.
+
 ### Focus-hover stutter: identity-only transport (2026-09-29)
+
+The startup lease and RMB ownership changes above supersede this revision's five-listener lifecycle and simultaneous camera-look behavior.
 
 Follow-up inspection confirmed the previous revision running with six projectile Actors, visibility checks/pre-shot previews off and no tracked shell. The user reported screen/camera/cursor stutter rather than shell motion; disabling the focused Highlight did not resolve it. A focused 360-frame sample averaged 12.24 ms, peaked at 26.93 ms and contained no >50 ms frame, with a 0.06 ms focus callback snapshot. These samples did not reproduce a long frame pause and do not disprove the reported hitch. The remaining moving-target attribute fan-out was removed as an isolation/performance change, not declared the proven sole cause.
 
@@ -16,7 +30,7 @@ Verification: full-source local compilation succeeded and **159 assertions** pas
 
 The identity-only transport above supersedes this revision's per-target Position/Velocity attribute listeners; its input and native-launch behavior remain current.
 
-**Aim → Targeting → Lock-on Key (Hold)** now chooses the redirection activation key. RMB remains the initial binding; **Reset Lock Key to RMB** restores it. Valid bindings are remembered across reloads. The control always uses hold mode: release, window focus loss, typing, or changing the binding clears engagement. UI-consumed input cannot engage it. Rebinding does not change freecam's independent RMB camera-look control; choose a separate keyboard key to lock without rotating freecam.
+**Aim → Targeting → Lock-on Key (Hold)** now chooses the redirection activation key. RMB remains the initial binding; **Reset Lock Key to RMB** restores it. Valid bindings are remembered across reloads. The control always uses hold mode: release, window focus loss, typing, or changing the binding clears engagement. UI-consumed input cannot engage it. With the input-ownership correction above, RMB focus keeps the freecam cursor free; choose a separate keyboard lock key to use RMB for camera look.
 
 **Target Visibility Check** is optional and initially off. Off selects the nearest living enemy projected inside the focus circle without sightline rays or rebuilding map ray filters. On retains the bounded four-candidate visibility check. Focus acquisition stays capped at 20 Hz, while a separate 2 Hz player roster reuses existing character records. Death, team changes, respawns and leaving the circle are validated each frame. Removing target visibility checks does not remove native shell collisions.
 

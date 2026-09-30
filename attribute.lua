@@ -459,6 +459,15 @@ end
 
 local triggerDirectFire = nil -- Assigned below after weapon hooks are ready
 
+local function freecamMouseLookAllowed()
+    -- A focus hold must not also warp the cursor or rotate the view. Arrow-key
+    -- look remains available; choosing a keyboard focus key restores RMB look.
+    local focusOwnsRMB = Settings.ShellRedirection
+        and Settings.ShellFocusKey == Enum.UserInputType.MouseButton2
+    return not focusOwnsRMB and UserInputService:GetFocusedTextBox() == nil
+        and UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+end
+
 local function setFreecam(enabled)
     local cam = workspace.CurrentCamera
     if not cam then return end
@@ -507,10 +516,8 @@ local function setFreecam(enabled)
             cam = workspace.CurrentCamera or cam
             cam.CameraType = Enum.CameraType.Scriptable
 
-            -- Keep the cursor movable for mouse-pointed shots. RMB temporarily
-            -- locks it for camera rotation, then releases it when RMB is let go.
-            local looking = UserInputService:GetFocusedTextBox() == nil
-                and UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+            -- RMB belongs either to focus or camera look, never both.
+            local looking = freecamMouseLookAllowed()
             local desiredMouseBehavior = looking and Enum.MouseBehavior.LockCenter or Enum.MouseBehavior.Default
             if UserInputService.MouseBehavior ~= desiredMouseBehavior then
                 UserInputService.MouseBehavior = desiredMouseBehavior
@@ -663,7 +670,7 @@ do
                 "Align both axes only for a selected high-arc fallback. Direct shots keep normal tracking; some native modes require the gunner optic active.")
             local aimTarget = aimTab:Section({ Name = "Targeting", Side = 2 })
             settingToggle(aimTarget, "Shell Redirection", "ShellRedirection",
-                "Fire normally, then hold your lock key to steer an airborne shell. Temporarily pauses adaptive aim, auto-elevation and pre-shot previews.")
+                "Fire normally, then hold your lock key to steer an airborne shell. Pauses launch assists. RMB lock keeps the freecam cursor free: use arrow keys to look, or choose a keyboard lock key to retain RMB look.")
             local lockKeyHandle
             lockKeyHandle = aimTarget:Label("Lock-on Key (Hold)"):AddKeybind({
                 Flag = "ALA_ShellFocusKey", Default = Settings.ShellFocusKey, Mode = "Hold",
@@ -1394,6 +1401,7 @@ if not original then return end
 local oldStatus = actor:GetAttribute("AttributeShellRedirectStatus")
 local cached, connections = {},{}
 local ownSeenAt = -math.huge
+local startupAt = os.clock()
 local function sampleTarget()
     if cached.Owner~=owner or cached.Held~=true or type(cached.TargetId)~="number" then
         cached.Position,cached.Velocity,cached.Part,cached.Target=nil,nil,nil,nil
@@ -1423,13 +1431,13 @@ local function refreshTarget()
     local ok,err=pcall(sampleTarget)
     if not ok then cached.Error=tostring(err);cached.Position,cached.Velocity=nil,nil end
 end
-for _, key in ipairs({"Owner","Held","Heartbeat","TargetId","Shot"}) do
+for _, key in ipairs({"Owner","Held","Heartbeat","TargetId","Shot","Initializing"}) do
     local attribute = "AttributeShellRedirect"..key
     cached[key] = player:GetAttribute(attribute)
     connections[#connections+1] = player:GetAttributeChangedSignal(attribute):Connect(function()
         local ok,value=pcall(player.GetAttribute,player,attribute)
         if ok then cached[key]=value else cached.Error=tostring(value) end
-        if key~="Heartbeat" then refreshTarget() end
+        if key~="Heartbeat" and key~="Initializing" then refreshTarget() end
     end)
 end
 refreshTarget()
@@ -1439,7 +1447,7 @@ wrapper = function(state, ...)
     -- per-projectile hot path. Only the simulation table is touched here.
     if type(state)=="table" and state.replicate==true and state.Behavior=="Default"
         and not state.destroy and not state.hitray and not state.physicalprojectile
-        and cached.Owner==owner and cached.Held==true and not cached.Error
+        and cached.Owner==owner and cached.Held==true and cached.Initializing~=true and not cached.Error
     then
         local now=os.clock()
         ownSeenAt=now
@@ -1465,8 +1473,13 @@ task.spawn(function()
             actor:SetAttribute("AttributeShellRedirectStatus", owner.."|error: "..cached.Error)
             errorPublished=true
         end
-        if cached.Owner~=owner or type(cached.Heartbeat)~="number"
-            or os.clock()-cached.Heartbeat >= 0.75 then break end
+        local now=os.clock()
+        if cached.Owner~=owner or type(cached.Heartbeat)~="number" then break end
+        -- Serial Actor installation can take longer than the normal heartbeat
+        -- lease. Allow bounded setup, then enforce the strict running lease.
+        if cached.Initializing==true then
+            if now-startupAt>=8 then break end
+        elseif now-cached.Heartbeat>=0.75 then break end
         local sampling=cached.Held and cached.TargetId and os.clock()-ownSeenAt<0.15
         if sampling then refreshTarget() end
         task.wait(sampling and 1/30 or 0.1)
@@ -1482,7 +1495,8 @@ task.spawn(function()
 end)
 ]=]
 shellRedirection.attributes = {"AttributeShellRedirectOwner","AttributeShellRedirectHeartbeat",
-    "AttributeShellRedirectTargetId","AttributeShellRedirectHeld","AttributeShellRedirectShot"}
+    "AttributeShellRedirectTargetId","AttributeShellRedirectHeld","AttributeShellRedirectShot",
+    "AttributeShellRedirectInitializing"}
 function shellRedirection.stop()
     if shellRedirection.originalAttributes and lp:GetAttribute("AttributeShellRedirectOwner")==shellRedirection.owner then
         for _, key in ipairs(shellRedirection.attributes) do
@@ -1512,6 +1526,7 @@ function shellRedirection.update()
         for _,key in ipairs(shellRedirection.attributes) do shellRedirection.originalAttributes[key]=lp:GetAttribute(key) end
         shellRedirection.owner = "Attribute:"..tostring(now)
         shellRedirection.publishedShot, shellRedirection.heartbeatAt, shellRedirection.statusAt = nil,nil,nil
+        lp:SetAttribute("AttributeShellRedirectInitializing",true)
         lp:SetAttribute("AttributeShellRedirectOwner",shellRedirection.owner)
         lp:SetAttribute("AttributeShellRedirectHeartbeat",now)
         shellRedirection.active, shellRedirection.actors = true,{}
@@ -1535,6 +1550,12 @@ function shellRedirection.update()
             shellRedirection.stop()
             return
         end
+        -- Refresh after installation, not from the stale frame-entry clock.
+        now=os.clock()
+        shellRedirection.installAt=now
+        shellRedirection.heartbeatAt=now
+        lp:SetAttribute("AttributeShellRedirectHeartbeat",now)
+        lp:SetAttribute("AttributeShellRedirectInitializing",false)
     end
     local engaged = shellRedirection.isEngaged() == true
     if lp:GetAttribute("AttributeShellRedirectHeld")~=engaged then lp:SetAttribute("AttributeShellRedirectHeld",engaged) end
@@ -2511,6 +2532,7 @@ end)
 local playerDrawings = {}
 local tankHighlights = {}
 local espStats = { players = 0, tanks = 0 }
+espStats.timings = { frameMs=0, playerDrawMs=0, tankDrawMs=0, playerScanMs=0, tankScanMs=0, armorScanMs=0 }
 -- WorldToViewportPoint pixels must not receive the top-bar/safe-area inset.
 -- Keep this separate so the existing impact HUD layout is unchanged.
 espStats.gui = Instance.new("ScreenGui")
@@ -2940,18 +2962,29 @@ RunService:BindToRenderStep("AttributePlayerESP", FREECAM_PRIORITY + 4, function
     local origin = camera.CFrame.Position
     if now - lastPlayerScan >= 0.25 then
         lastPlayerScan = now
+        local started=os.clock()
         scanEnemyPlayers(origin)
+        espStats.timings.playerScanMs=(os.clock()-started)*1000
     end
+    local started=os.clock()
     updatePlayerDrawings(camera)
+    espStats.timings.playerDrawMs=(os.clock()-started)*1000
+    started=os.clock()
     espStats.drawTanks(camera)
+    espStats.timings.tankDrawMs=(os.clock()-started)*1000
     if now - lastTankScan >= 0.75 then
         lastTankScan = now
+        started=os.clock()
         scanEnemyTanks(origin)
+        espStats.timings.tankScanMs=(os.clock()-started)*1000
     end
     if now - lastArmorScan >= 1.5 then
         lastArmorScan = now
+        started=os.clock()
         scanEnemyArmor()
+        espStats.timings.armorScanMs=(os.clock()-started)*1000
     end
+    espStats.timings.frameMs=(os.clock()-now)*1000
 end)
 
 -- ===================================================================
@@ -4320,6 +4353,8 @@ _G.AutoLeadAssistDiagnostics = function()
             held = shellRedirection.held, engaged = shellRedirection.isEngaged() == true,
             focusedPlayer = shellRedirection.focused and shellRedirection.focused.Name or nil,
             transport = "actor-local target sampling",
+            freecamRmbOwner = Settings.ShellRedirection and Settings.ShellFocusKey==Enum.UserInputType.MouseButton2
+                and "target lock" or "camera look",
             updateMs = shellRedirection.updateMs,
             readyActors = shellRedirection.ready or 0, error = shellRedirection.error,
             focusScans = shellRedirection.focusScans, focusRays = shellRedirection.focusRays,
@@ -4337,6 +4372,7 @@ _G.AutoLeadAssistDiagnostics = function()
         lastShot = lastShotDiagnostics,
         preview = visualDiagnostics,
         esp = { players = espStats.players, tanks = espStats.tanks,
+            timings = espStats.timings,
             backend = playerEsp and "esp-lib.lua" or "unavailable", error = espStats.error,
             playerEnabled = Settings.PlayerESP, tankEnabled = Settings.EnemyTankESP,
             boxesEnabled = Settings.ESPBoxes },

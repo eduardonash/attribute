@@ -15,7 +15,10 @@ local Settings={ShellRedirection=true,ShellFocusRadius=60,ShellFocusCircle=true,
     ShellFocusHighlight=true,ShellFocusColor=Color3.fromRGB(255,209,90)}
 local shellRedirection={players={},records={},candidates={},held=true,heldKey=Settings.ShellFocusKey}
 local Players={}
-local attrs={AttributeShellRedirectOwner="fixture",AttributeShellRedirectHeartbeat=os.clock(),AttributeShellRedirectHeld=true}
+local actorTime=0
+local os={clock=function()return actorTime end}
+local attrs={AttributeShellRedirectOwner="fixture",AttributeShellRedirectHeartbeat=os.clock(),
+    AttributeShellRedirectHeld=true,AttributeShellRedirectInitializing=true}
 local attributeReads=0
 local attributeWrites={}
 local attributeSignals={}
@@ -182,6 +185,19 @@ local task={spawn=function(fn)cleanup=fn end,wait=function()coroutine.yield("wai
 check(environment.simulatebullet~=original and actorAttrs.AttributeShellRedirectStatus=="fixture","Actor environment hook confirms installation")
 lp:SetAttribute("AttributeShellRedirectTargetId",202)
 local monitor=coroutine.create(cleanup)
+actorTime=2
+check(coroutine.resume(monitor) and coroutine.status(monitor)=="suspended"
+    and actorAttrs.AttributeShellRedirectStatus=="fixture",
+    "initializing Actor survives serial installation beyond the steady-state lease")
+lp:SetAttribute("AttributeShellRedirectHeartbeat",actorTime)
+lp:SetAttribute("AttributeShellRedirectShot",1)
+s=state();environment.simulatebullet(s)
+check(s.velocity==Vector3.xAxis*100,"initializing Actor does not steer shells before host is ready")
+calls=0
+lp:SetAttribute("AttributeShellRedirectHeartbeat",actorTime)
+lp:SetAttribute("AttributeShellRedirectInitializing",false)
+check(coroutine.resume(monitor) and coroutine.status(monitor)=="suspended",
+    "fresh post-install heartbeat starts the steady-state Actor lease")
 local poseReadsBefore=poseReads
 for i=1,10 do check(coroutine.resume(monitor),"idle Actor monitor remains scheduled")end
 check(poseReads==poseReadsBefore,"hovering with no own shell performs no repeated Actor pose sampling")
@@ -220,14 +236,82 @@ s=state();environment.simulatebullet(s)
 check(s.velocity==Vector3.xAxis*100,"disabled owner stops steering immediately")
 check(coroutine.resume(monitor) and coroutine.status(monitor)=="dead","Actor monitor terminates on owner loss")
 check(environment.simulatebullet==original and actorAttrs.AttributeShellRedirectStatus==nil,"cleanup restores owned callback/status")
-check(attributeDisconnects==5,"Actor cleanup disconnects all target attribute listeners")
+check(attributeDisconnects==6,"Actor cleanup disconnects all target and initialization attribute listeners")
+]]
+    code=code..[[
+do
+    lp:SetAttribute("AttributeShellRedirectOwner","fixture")
+    lp:SetAttribute("AttributeShellRedirectHeartbeat",actorTime)
+    lp:SetAttribute("AttributeShellRedirectInitializing",true)
+]]..actorSource..[[
+    local leaseMonitor=coroutine.create(cleanup)
+    actorTime+=1
+    check(coroutine.resume(leaseMonitor) and coroutine.status(leaseMonitor)=="suspended",
+        "startup grace permits delayed confirmation without discarding Actor access")
+    lp:SetAttribute("AttributeShellRedirectHeartbeat",actorTime)
+    lp:SetAttribute("AttributeShellRedirectInitializing",false)
+    check(coroutine.resume(leaseMonitor) and coroutine.status(leaseMonitor)=="suspended",
+        "steady-state lease uses the refreshed completion timestamp")
+    actorTime+=0.74
+    check(coroutine.resume(leaseMonitor) and coroutine.status(leaseMonitor)=="suspended",
+        "completed Actor remains alive before the strict heartbeat deadline")
+    actorTime+=0.02
+    check(coroutine.resume(leaseMonitor) and coroutine.status(leaseMonitor)=="dead"
+        and environment.simulatebullet==original and actorAttrs.AttributeShellRedirectStatus==nil,
+        "completed Actor restores hook when the strict heartbeat lease expires")
+end
+do
+    lp:SetAttribute("AttributeShellRedirectOwner","fixture")
+    lp:SetAttribute("AttributeShellRedirectHeartbeat",actorTime)
+    lp:SetAttribute("AttributeShellRedirectInitializing",true)
+]]..actorSource..[[
+    local abandonedMonitor=coroutine.create(cleanup)
+    actorTime+=8.1
+    check(coroutine.resume(abandonedMonitor) and coroutine.status(abandonedMonitor)=="dead"
+        and environment.simulatebullet==original and actorAttrs.AttributeShellRedirectStatus==nil,
+        "abandoned initializing Actor has a bounded startup lease and restores its hook")
+end
+check(attributeDisconnects==18,"all startup, completed and expired Actor sessions release their listeners")
 ]]
     code=code..[[
 local publicationTime=1
 local os={clock=function()return publicationTime end}
-]]..section('function shellRedirection.update(', 'function shellRedirection.assign(')..[[
+local ReplicatedStorage,getactors,run_on_actor
+]]..section('shellRedirection.attributes =', 'function shellRedirection.update(')
+        ..section('function shellRedirection.update(', 'function shellRedirection.assign(')..[[
+local threads={}
+local installedActors={}
+for i=1,2 do
+    local values={}
+    installedActors[i]={Name=tostring(i),Parent=threads,IsA=function(_,class)return class=="Actor" end,
+        GetAttribute=function(_,key)return values[key]end,SetAttribute=function(_,key,value)values[key]=value end}
+end
+ReplicatedStorage={FindFirstChild=function(_,name)
+    if name=="PHRST" then return {FindFirstChild=function(_,key)if key=="Threads" then return threads end end} end
+end}
+getactors=function()return installedActors end
+local startupCalls=0
+run_on_actor=function(installed,source)
+    startupCalls+=1
+    check(attrs.AttributeShellRedirectInitializing==true,"host marks installation before each Actor dispatch")
+    publicationTime+=0.9
+    installed:SetAttribute("AttributeShellRedirectStatus",attrs.AttributeShellRedirectOwner)
+end
+shellRedirection.actorSource="fixture @ACTOR@ @OWNER@ @STEER@"
+shellRedirection.steerSource=""
+shellRedirection.active=false;shellRedirection.failed=nil;shellRedirection.error=nil
+shellRedirection.update()
+check(startupCalls==2 and shellRedirection.ready==2 and not shellRedirection.failed,
+    "host retains confirmed Actors after serial installs exceed the heartbeat lease")
+check(attrs.AttributeShellRedirectInitializing==false,"host clears initialization only after all Actor installs")
+check(attrs.AttributeShellRedirectHeartbeat==publicationTime and shellRedirection.heartbeatAt==publicationTime,
+    "host publishes a fresh completion heartbeat rather than the stale update-entry timestamp")
+check(shellRedirection.installAt==publicationTime,"Actor confirmation timeout starts after installation completes")
+shellRedirection.stop()
+publicationTime=1
 shellRedirection.active=true;shellRedirection.owner="fixture"
 shellRedirection.actors={actor};shellRedirection.ready=1;shellRedirection.installAt=1
+shellRedirection.heartbeatAt=nil;shellRedirection.statusAt=nil;shellRedirection.publishedShot=nil
 actorAttrs.AttributeShellRedirectStatus="fixture"
 lp:SetAttribute("AttributeShellRedirectOwner","fixture")
 shellRedirection.held=true;shellRedirection.heldKey=Settings.ShellFocusKey
