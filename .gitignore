@@ -9,3 +9,4 @@
 !/tests/adaptive-ballistics.spec.lua
 !/tests/shell-redirection.spec.lua
 !/tests/freecam-input.spec.lua
+!/tests/focus-performance.spec.lua

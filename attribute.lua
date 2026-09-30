@@ -1217,6 +1217,61 @@ end
 -- rendered frame so the preview does not lag behind mouse movement.
 local shellRedirection = { players = {}, records = {}, candidates = {}, focused = nil, held = false,
     focusScans = 0, focusRays = 0, visualWrites = 0 }
+shellRedirection.performance = {
+    acquisition={name="AutoLead_Acquisition",count=0,totalMs=0,lastMs=0,maxMs=0,over5Ms=0,over50Ms=0},
+    frame={name="AutoLead_FocusFrame",count=0,totalMs=0,lastMs=0,maxMs=0,over5Ms=0,over50Ms=0},
+    transport={name="AutoLead_Transport",count=0,totalMs=0,lastMs=0,maxMs=0,over5Ms=0,over50Ms=0},
+    installation={name="AutoLead_ActorInstall",count=0,totalMs=0,lastMs=0,maxMs=0,over5Ms=0,over50Ms=0},
+    intervals={frames=0,window=0,durationMs=0,phases={"released","heldEmpty","heldTarget"},
+        released={count=0,totalMs=0,maxMs=0,over25Ms=0,over50Ms=0},
+        heldEmpty={count=0,totalMs=0,maxMs=0,over25Ms=0,over50Ms=0},
+        heldTarget={count=0,totalMs=0,maxMs=0,over25Ms=0,over50Ms=0}}
+}
+function shellRedirection.profileBegin(stage)
+    local bucket=shellRedirection.performance[stage]
+    bucket.marked=false
+    -- Executor installation can yield. Time it separately without leaving a
+    -- native profiler marker open across that operation.
+    if stage~="installation" and debug and type(debug.profilebegin)=="function" and type(debug.profileend)=="function" then
+        bucket.marked=pcall(debug.profilebegin,bucket.name)
+    end
+    return os.clock()
+end
+function shellRedirection.profileEnd(stage,started)
+    local bucket=shellRedirection.performance[stage]
+    local elapsed=(os.clock()-started)*1000
+    if bucket.marked then pcall(debug.profileend);bucket.marked=false end
+    bucket.count+=1;bucket.totalMs+=elapsed;bucket.lastMs=elapsed
+    bucket.meanMs=bucket.totalMs/bucket.count
+    bucket.maxMs=math.max(bucket.maxMs,elapsed)
+    if elapsed>5 then bucket.over5Ms+=1 end
+    if elapsed>50 then bucket.over50Ms+=1 end
+end
+function shellRedirection.recordInterval(now)
+    local stats=shellRedirection.performance.intervals
+    local previous=shellRedirection.previousFrameTime
+    shellRedirection.previousFrameTime=now
+    if not previous then return end
+    -- Reuse a bounded 240-frame window, never growing a sample array or logging
+    -- from a render callback. The phase labels describe state, not causality.
+    if stats.frames>=240 then
+        stats.frames=0;stats.window+=1;stats.durationMs=0
+        for _,name in ipairs(stats.phases) do
+            local bucket=stats[name]
+            bucket.count=0;bucket.totalMs=0;bucket.meanMs=0;bucket.maxMs=0;bucket.over25Ms=0;bucket.over50Ms=0
+        end
+    end
+    stats.frames+=1
+    local name=not shellRedirection.isEngaged() and "released"
+        or shellRedirection.focused and "heldTarget" or "heldEmpty"
+    local bucket=stats[name]
+    local elapsed=(now-previous)*1000
+    stats.durationMs+=elapsed
+    bucket.count+=1;bucket.totalMs+=elapsed;bucket.maxMs=math.max(bucket.maxMs,elapsed)
+    bucket.meanMs=bucket.totalMs/bucket.count
+    if elapsed>25 then bucket.over25Ms+=1 end
+    if elapsed>50 then bucket.over50Ms+=1 end
+end
 local aimIncludeParams = RaycastParams.new()
 aimIncludeParams.FilterType = Enum.RaycastFilterType.Include
 aimIncludeParams.IgnoreWater = true
@@ -1260,9 +1315,20 @@ end
 function shellRedirection.refreshPlayers(now)
     if now < (shellRedirection.nextRoster or 0) then return end
     shellRedirection.nextRoster = now + 0.5
+    if not shellRedirection.roster then
+        shellRedirection.roster=Players:GetPlayers()
+        shellRedirection.rosterAdded=Players.PlayerAdded:Connect(function(player)
+            shellRedirection.roster[#shellRedirection.roster+1]=player
+        end)
+        shellRedirection.rosterRemoved=Players.PlayerRemoving:Connect(function(player)
+            local index=table.find(shellRedirection.roster,player)
+            if index then table.remove(shellRedirection.roster,index) end
+            shellRedirection.records[player]=nil
+        end)
+    end
     table.clear(shellRedirection.players)
-    for _, player in ipairs(Players:GetPlayers()) do
-        local character = player ~= lp and player.Character
+    for _, player in ipairs(shellRedirection.roster) do
+        local character = player.Parent==Players and player ~= lp and player.Character
         local record = shellRedirection.records[player]
         if character and (not record or record.character ~= character or not record.part.Parent
             or not record.humanoid.Parent) then
@@ -1290,9 +1356,17 @@ function shellRedirection.release()
     shellRedirection.held, shellRedirection.focused, shellRedirection.focusedPart = false,nil,nil
     shellRedirection.heldKey = nil
     shellRedirection.focusedRecord, shellRedirection.nextFocusScan = nil,nil
-    if shellRedirection.active and lp:GetAttribute("AttributeShellRedirectOwner")==shellRedirection.owner then
-        lp:SetAttribute("AttributeShellRedirectHeld",false)
-        lp:SetAttribute("AttributeShellRedirectTargetId",nil)
+    if shellRedirection.active and (shellRedirection.flightActive or shellRedirection.publishedHeld
+        or shellRedirection.publishedTargetId) and lp:GetAttribute("AttributeShellRedirectOwner")==shellRedirection.owner then
+        if lp:GetAttribute("AttributeShellRedirectHeld")~=false then
+            lp:SetAttribute("AttributeShellRedirectHeld",false)
+            shellRedirection.publicationWrites=(shellRedirection.publicationWrites or 0)+1
+        end
+        if lp:GetAttribute("AttributeShellRedirectTargetId")~=nil then
+            lp:SetAttribute("AttributeShellRedirectTargetId",nil)
+            shellRedirection.publicationWrites=(shellRedirection.publicationWrites or 0)+1
+        end
+        shellRedirection.publishedHeld,shellRedirection.publishedTargetId=false,nil
     end
     if shellRedirection.visuals then
         shellRedirection.visuals.tracer.Visible = false
@@ -1320,6 +1394,9 @@ function shellRedirection.select(cam, pixel, origin)
     shellRedirection.focusScans=(shellRedirection.focusScans or 0)+1
     local candidates = shellRedirection.candidates
     table.clear(candidates)
+    local visibility=Settings.ShellVisibilityCheck
+    local nearest,nearestDistance=nil,math.huge
+    local cameraPosition,cameraLook=cam.CFrame.Position,cam.CFrame.LookVector
     local radiusSquared = Settings.ShellFocusRadius * Settings.ShellFocusRadius
     for _, record in ipairs(shellRedirection.players) do
         local player, part = record.player, record.part
@@ -1327,11 +1404,17 @@ function shellRedirection.select(cam, pixel, origin)
         if player.Parent == Players and player.Character == record.character
             and part.Parent and record.humanoid.Health > 0
             and not player.Neutral and player.Team ~= nil and player.Team ~= lp.Team then
-            local point, visible = cam:WorldToViewportPoint(part.Position)
+            local position=part.Position
+            if (position-cameraPosition):Dot(cameraLook)<=0 then continue end
+            local point, visible = cam:WorldToViewportPoint(position)
             local distance = (point.X-pixel.X)^2 + (point.Y-pixel.Y)^2
             if visible and point.Z > 0 and distance <= radiusSquared then
-                -- No sightline check needs only the nearest projected enemy.
-                local limit = Settings.ShellVisibilityCheck and 4 or 1
+                if not visibility then
+                    if distance<nearestDistance then nearest,nearestDistance=record,distance end
+                    continue
+                end
+                -- Visibility checks retain only the four nearest candidates.
+                local limit = 4
                 local index = 1
                 while candidates[index] and candidates[index].focusDistance <= distance do index += 1 end
                 if index <= limit then
@@ -1341,6 +1424,14 @@ function shellRedirection.select(cam, pixel, origin)
                 end
             end
         end
+    end
+    if not visibility then
+        if nearest then
+            shellRedirection.focused,shellRedirection.focusedPart,shellRedirection.focusedRecord=
+                nearest.player,nearest.part,nearest
+            return nearest.part.Position,nearest.part.AssemblyLinearVelocity,nearest.part,Vector3.yAxis
+        end
+        return
     end
     for _, record in ipairs(candidates) do
         local hit
@@ -1355,6 +1446,15 @@ function shellRedirection.select(cam, pixel, origin)
             return record.part.Position, record.part.AssemblyLinearVelocity, record.part, Vector3.yAxis
         end
     end
+end
+function shellRedirection.acquire(cam,pixel,now)
+    shellRedirection.refreshPlayers(now)
+    local origin
+    if Settings.ShellVisibilityCheck then
+        refreshAimFilters(getActiveTank())
+        origin=cam:ViewportPointToRay(pixel.X,pixel.Y).Origin
+    end
+    return shellRedirection.select(cam,pixel,origin)
 end
 
 -- Runs inside each native projectile Actor, where the real simulation tables live.
@@ -1397,10 +1497,47 @@ end
 if not original then return end
 @STEER@
 local oldStatus = actor:GetAttribute("AttributeShellRedirectStatus")
+local oldActive = actor:GetAttribute("AttributeShellRedirectActive")
 local cached, connections = {},{}
 local ownSeenAt = -math.huge
-local shotWakeUntil = -math.huge
 local startupAt = os.clock()
+local live, sampling, activePublished = true,false,false
+local wrapper, monitorTask, leaseTask
+local wake, armLease
+local function cleanupOwnedActor()
+    if not live then return end
+    live=false
+    if env.simulatebullet==wrapper then env.simulatebullet=original end
+    for _, connection in ipairs(connections) do connection:Disconnect() end
+    if monitorTask and monitorTask~=coroutine.running() then pcall(task.cancel,monitorTask) end
+    if leaseTask then pcall(task.cancel,leaseTask);leaseTask=nil end
+    if actor.Parent then
+        local status=actor:GetAttribute("AttributeShellRedirectStatus")
+        if type(status)=="string" and status:sub(1,#owner)==owner then
+            actor:SetAttribute("AttributeShellRedirectStatus",oldStatus)
+        end
+        if actor:GetAttribute("AttributeShellRedirectActive")==owner then
+            actor:SetAttribute("AttributeShellRedirectActive",oldActive)
+        end
+    end
+end
+local function leaseValid(now)
+    return cached.Owner==owner and type(cached.Heartbeat)=="number"
+        and (cached.Initializing==true and now-startupAt<8
+            or cached.Initializing~=true and now-cached.Heartbeat<0.75)
+end
+armLease=function(reset)
+    if not live then return end
+    if reset and leaseTask then pcall(task.cancel,leaseTask);leaseTask=nil end
+    if leaseTask then return end
+    local deadline=cached.Initializing==true and startupAt+8 or (cached.Heartbeat or -math.huge)+0.75
+    leaseTask=task.delay(math.max(0,deadline-os.clock()),function()
+        leaseTask=nil
+        if not actor.Parent or not player.Parent or env.simulatebullet~=wrapper
+            or not leaseValid(os.clock()) then cleanupOwnedActor()
+        else armLease() end
+    end)
+end
 local function sampleTarget()
     if cached.Owner~=owner or cached.Held~=true or type(cached.TargetId)~="number" then
         cached.Position,cached.Velocity,cached.Part,cached.Target=nil,nil,nil,nil
@@ -1430,6 +1567,35 @@ local function refreshTarget()
     local ok,err=pcall(sampleTarget)
     if not ok then cached.Error=tostring(err);cached.Position,cached.Velocity=nil,nil end
 end
+wake=function()
+    -- Attribute signals belong to this executor-owned setup. Native simulation
+    -- only records Lua activity; it never schedules threads or touches Instances.
+    if not live or sampling or cached.Initializing==true or os.clock()-ownSeenAt>=0.15 then return end
+    sampling=true
+    monitorTask=task.defer(function()
+        while live do
+            local now=os.clock()
+            if not actor.Parent or not player.Parent or env.simulatebullet~=wrapper
+                or not leaseValid(now) then cleanupOwnedActor();break end
+            local active=cached.Initializing~=true and now-ownSeenAt<0.15
+            if active~=activePublished then
+                activePublished=active
+                if active then actor:SetAttribute("AttributeShellRedirectActive",owner)
+                elseif actor:GetAttribute("AttributeShellRedirectActive")==owner then
+                    actor:SetAttribute("AttributeShellRedirectActive",oldActive)
+                end
+            end
+            if not active then break end
+            if cached.Held==true and type(cached.TargetId)=="number" then refreshTarget() end
+            if cached.Error then
+                actor:SetAttribute("AttributeShellRedirectStatus",owner.."|error: "..cached.Error)
+                break
+            end
+            task.wait(1/30)
+        end
+        sampling=false;monitorTask=nil
+    end)
+end
 for _, key in ipairs({"Owner","Held","Heartbeat","TargetId","Shot","Initializing"}) do
     local attribute = "AttributeShellRedirect"..key
     cached[key] = player:GetAttribute(attribute)
@@ -1445,18 +1611,24 @@ for _, key in ipairs({"Owner","Held","Heartbeat","TargetId","Shot","Initializing
             if key=="Owner" or key=="TargetId" then
                 cached.Part,cached.Target,cached.Character,cached.Humanoid=nil,nil,nil,nil
             end
-        elseif key=="Shot" and cached.Initializing~=true and type(previous)=="number"
-            and type(value)=="number" and value>previous then
-            shotWakeUntil=os.clock()+0.15
         end
+        if cached.Owner~=owner then cleanupOwnedActor();return end
+        if key=="Initializing" then armLease(true) end
+        if key=="Shot" and type(previous)=="number" and type(value)=="number" and value>previous then
+            -- One deferred check per confirmed dispatch; empty Actors never
+            -- enter a polling loop just because another Actor owns that shot.
+            task.defer(function()wake()end)
+        else wake() end
     end)
 end
-local wrapper
 wrapper = function(state, ...)
     -- Observe own flight activity before lock-on, but keep all target Instance
     -- access in the owned monitor, never these native simulation callbacks.
     if type(state)=="table" and state.replicate==true and state.Behavior=="Default"
         and not state.destroy and not state.hitray and not state.physicalprojectile
+        and typeof(state.position)=="Vector3" and typeof(state.position0)=="Vector3"
+        and typeof(state.velocity)=="Vector3" and state.velocity.Magnitude>=1
+        and (state.position-state.position0).Magnitude>=15
     then
         local now=os.clock()
         ownSeenAt=now
@@ -1476,41 +1648,15 @@ wrapper = function(state, ...)
 end
 env.simulatebullet = wrapper
 actor:SetAttribute("AttributeShellRedirectStatus",owner)
-task.spawn(function()
-    local errorPublished=false
-    while player.Parent and actor.Parent and env.simulatebullet==wrapper do
-        if cached.Error and not errorPublished then
-            actor:SetAttribute("AttributeShellRedirectStatus", owner.."|error: "..cached.Error)
-            errorPublished=true
-        end
-        local now=os.clock()
-        if cached.Owner~=owner or type(cached.Heartbeat)~="number" then break end
-        -- Serial Actor installation can take longer than the normal heartbeat
-        -- lease. Allow bounded setup, then enforce the strict running lease.
-        if cached.Initializing==true then
-            if now-startupAt>=8 then break end
-        elseif now-cached.Heartbeat>=0.75 then break end
-        local armed=cached.Held==true and type(cached.TargetId)=="number" and cached.Initializing~=true
-        local sampling=armed and (now-ownSeenAt<0.15 or now<shotWakeUntil)
-        if sampling then refreshTarget() end
-        -- Held acquisition stays responsive, but only flying/confirmed shots
-        -- cause target reads. Other Actors merely check their cached flags.
-        task.wait(cached.Held and 1/30 or 0.1)
-    end
-    if env.simulatebullet==wrapper then env.simulatebullet=original end
-    for _, connection in ipairs(connections) do connection:Disconnect() end
-    if actor.Parent then
-        local status = actor:GetAttribute("AttributeShellRedirectStatus")
-        if type(status)=="string" and status:sub(1,#owner)==owner then
-            actor:SetAttribute("AttributeShellRedirectStatus",oldStatus)
-        end
-    end
-end)
+armLease()
 ]=]
 shellRedirection.attributes = {"AttributeShellRedirectOwner","AttributeShellRedirectHeartbeat",
     "AttributeShellRedirectTargetId","AttributeShellRedirectHeld","AttributeShellRedirectShot",
     "AttributeShellRedirectInitializing"}
 function shellRedirection.stop()
+    for _,connection in ipairs(shellRedirection.actorConnections or {}) do connection:Disconnect() end
+    shellRedirection.actorConnections=nil;shellRedirection.activeActors=nil;shellRedirection.launchWakeUntil=nil
+    shellRedirection.flightActive,shellRedirection.publishedHeld,shellRedirection.publishedTargetId=false,nil,nil
     if shellRedirection.originalAttributes and lp:GetAttribute("AttributeShellRedirectOwner")==shellRedirection.owner then
         for _, key in ipairs(shellRedirection.attributes) do
             lp:SetAttribute(key,shellRedirection.originalAttributes[key])
@@ -1543,6 +1689,7 @@ function shellRedirection.update()
         lp:SetAttribute("AttributeShellRedirectOwner",shellRedirection.owner)
         lp:SetAttribute("AttributeShellRedirectHeartbeat",now)
         shellRedirection.active, shellRedirection.actors = true,{}
+        shellRedirection.activeActors,shellRedirection.actorConnections={},{}
         shellRedirection.installAt = now
         local ok,err = pcall(function()
             local phrst = ReplicatedStorage:FindFirstChild("PHRST")
@@ -1553,7 +1700,18 @@ function shellRedirection.update()
                         :gsub("@OWNER@",function() return string.format("%q",shellRedirection.owner) end)
                         :gsub("@STEER@",function() return shellRedirection.steerSource end)
                     local installed = pcall(run_on_actor,actor,code)
-                    if installed then shellRedirection.actors[#shellRedirection.actors+1]=actor end
+                    if installed then
+                        shellRedirection.actors[#shellRedirection.actors+1]=actor
+                        local installedOwner=shellRedirection.owner
+                        local function activityChanged()
+                            if shellRedirection.active and shellRedirection.owner==installedOwner then
+                                shellRedirection.activeActors[actor]=actor:GetAttribute("AttributeShellRedirectActive")==installedOwner or nil
+                            end
+                        end
+                        shellRedirection.actorConnections[#shellRedirection.actorConnections+1]=
+                            actor:GetAttributeChangedSignal("AttributeShellRedirectActive"):Connect(activityChanged)
+                        activityChanged()
+                    end
                 end
             end
         end)
@@ -1570,20 +1728,33 @@ function shellRedirection.update()
         lp:SetAttribute("AttributeShellRedirectHeartbeat",now)
         lp:SetAttribute("AttributeShellRedirectInitializing",false)
     end
-    local engaged = shellRedirection.isEngaged() == true
-    if lp:GetAttribute("AttributeShellRedirectHeld")~=engaged then lp:SetAttribute("AttributeShellRedirectHeld",engaged) end
+    local shot=shellRedirection.shotSerial or 0
+    if shellRedirection.publishedShot~=shot then
+        if shellRedirection.publishedShot~=nil and shot>shellRedirection.publishedShot then
+            shellRedirection.launchWakeUntil=now+0.35
+        end
+        shellRedirection.publishedShot=shot
+        lp:SetAttribute("AttributeShellRedirectShot",shot)
+    end
+    local flightActive=now<(shellRedirection.launchWakeUntil or 0) or next(shellRedirection.activeActors or {})~=nil
+    shellRedirection.flightActive=flightActive
+    local engaged = flightActive and shellRedirection.isEngaged() == true
+    if lp:GetAttribute("AttributeShellRedirectHeld")~=engaged then
+        lp:SetAttribute("AttributeShellRedirectHeld",engaged)
+        shellRedirection.publicationWrites=(shellRedirection.publicationWrites or 0)+1
+    end
+    shellRedirection.publishedHeld=engaged
     local focused = shellRedirection.focused
     local record=shellRedirection.focusedRecord
     local part=record and record.part
     local valid = engaged and record and focused==record.player and focused.Parent==Players
         and focused.Character==record.character and record.humanoid.Health>0 and part.Parent
     local targetId=valid and focused.UserId or nil
-    if lp:GetAttribute("AttributeShellRedirectTargetId")~=targetId then lp:SetAttribute("AttributeShellRedirectTargetId",targetId) end
-    local shot=shellRedirection.shotSerial or 0
-    if shellRedirection.publishedShot~=shot then
-        shellRedirection.publishedShot=shot
-        lp:SetAttribute("AttributeShellRedirectShot",shot)
+    if lp:GetAttribute("AttributeShellRedirectTargetId")~=targetId then
+        lp:SetAttribute("AttributeShellRedirectTargetId",targetId)
+        shellRedirection.publicationWrites=(shellRedirection.publicationWrites or 0)+1
     end
+    shellRedirection.publishedTargetId=targetId
     if now-(shellRedirection.heartbeatAt or -1)>=0.25 then
         shellRedirection.heartbeatAt=now
         lp:SetAttribute("AttributeShellRedirectHeartbeat",now)
@@ -1709,13 +1880,10 @@ function shellRedirection.frame(cam)
         -- checked each rendered frame so leaving the circle clears immediately.
         if not shellRedirection.nextFocusScan or now>=shellRedirection.nextFocusScan then
             shellRedirection.nextFocusScan=now+0.05
-            shellRedirection.refreshPlayers(now)
-            local origin
-            if Settings.ShellVisibilityCheck then
-                refreshAimFilters(getActiveTank())
-                origin=cam:ViewportPointToRay(pixel.X,pixel.Y).Origin
-            end
-            shellRedirection.select(cam,pixel,origin)
+            local started=shellRedirection.profileBegin("acquisition")
+            local ok,err=pcall(shellRedirection.acquire,cam,pixel,now)
+            shellRedirection.profileEnd("acquisition",started)
+            if not ok then error(err,0) end
         else
             local record=shellRedirection.focusedRecord
             local valid=record and record.player.Parent==Players and record.player.Character==record.character
@@ -1738,7 +1906,8 @@ function shellRedirection.destroy()
     shellRedirection.destroyed=true
     shellRedirection.release()
     shellRedirection.stop()
-    for _, connection in ipairs({shellRedirection.began,shellRedirection.ended,shellRedirection.focusLost,shellRedirection.tick}) do
+    for _, connection in ipairs({shellRedirection.began,shellRedirection.ended,shellRedirection.focusLost,shellRedirection.tick,
+        shellRedirection.rosterAdded,shellRedirection.rosterRemoved}) do
         if connection then connection:Disconnect() end
     end
     local visuals=shellRedirection.visuals
@@ -2960,9 +3129,11 @@ RunService:BindToRenderStep("AttributePlayerESP", FREECAM_PRIORITY + 4, function
     local now = os.clock()
     local camera = workspace.CurrentCamera
     if not camera then return end
-    local focusStarted=os.clock()
+    local focusStarted=shellRedirection.profileBegin("frame")
     local focusOK,focusError=pcall(shellRedirection.frame,camera)
+    shellRedirection.profileEnd("frame",focusStarted)
     shellRedirection.frameMs=(os.clock()-focusStarted)*1000
+    shellRedirection.recordInterval(now)
     if not focusOK then
         shellRedirection.error=tostring(focusError); shellRedirection.failed=true
         pcall(shellRedirection.release); pcall(shellRedirection.stop)
@@ -4331,7 +4502,14 @@ triggerDirectFire = function()
     return fired == true, fired == true and "Fired" or "Game rejected fire request"
 end
 
+-- Timing-only read: no target raycast, Instance traversal or table allocation.
+_G.AutoLeadAssistFocusTelemetry = function() return shellRedirection.performance end
+
 _G.AutoLeadAssistDiagnostics = function()
+    local activeActorCount=0
+    if shellRedirection.activeActors then
+        for _ in pairs(shellRedirection.activeActors) do activeActorCount+=1 end
+    end
     local veh = getActiveTank()
     local weapon = veh and getActiveWeaponData(veh)
     local hum = lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
@@ -4365,8 +4543,12 @@ _G.AutoLeadAssistDiagnostics = function()
             launchAssistsSuspended = Settings.ShellRedirection,
             held = shellRedirection.held, engaged = shellRedirection.isEngaged() == true,
             focusedPlayer = shellRedirection.focused and shellRedirection.focused.Name or nil,
-            transport = "flight-gated actor-local target sampling",
+            transport = "event-driven flight-gated actor sampling",
             freecamRmbOwner = "camera look",
+            flightActive = shellRedirection.flightActive == true,
+            activeActors = activeActorCount,
+            publicationWrites = shellRedirection.publicationWrites or 0,
+            performance = shellRedirection.performance,
             updateMs = shellRedirection.updateMs,
             readyActors = shellRedirection.ready or 0, error = shellRedirection.error,
             focusScans = shellRedirection.focusScans, focusRays = shellRedirection.focusRays,
@@ -4530,8 +4712,14 @@ shellRedirection.ended=UserInputService.InputEnded:Connect(shellRedirection.inpu
 shellRedirection.focusLost=UserInputService.WindowFocusReleased:Connect(shellRedirection.release)
 shellRedirection.tick=RunService.Heartbeat:Connect(function()
     -- Never fan out Actor state from the camera/render callback.
-    local started=os.clock()
+    if not Settings.ShellRedirection and not shellRedirection.active and not shellRedirection.failed then return end
+    if shellRedirection.transportBusy then return end
+    shellRedirection.transportBusy=true
+    local stage=not shellRedirection.active and Settings.ShellRedirection and "installation" or "transport"
+    local started=shellRedirection.profileBegin(stage)
     local ok,err=pcall(shellRedirection.update)
+    shellRedirection.profileEnd(stage,started)
+    shellRedirection.transportBusy=false
     shellRedirection.updateMs=(os.clock()-started)*1000
     if not ok then
         shellRedirection.error=tostring(err);shellRedirection.failed=true
@@ -4616,6 +4804,7 @@ _G.AutoLeadAssistUnload = function()
     firingShake.restoreExplosions()
     firingShake.restoreSink()
     _G.AutoLeadAssistDiagnostics = nil
+    _G.AutoLeadAssistFocusTelemetry = nil
     _G.AutoLeadAssistSetFreecam = nil
     _G.AutoLeadAssistSetZoom = nil
 end
