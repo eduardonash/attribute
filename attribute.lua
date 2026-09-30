@@ -460,11 +460,9 @@ end
 local triggerDirectFire = nil -- Assigned below after weapon hooks are ready
 
 local function freecamMouseLookAllowed()
-    -- A focus hold must not also warp the cursor or rotate the view. Arrow-key
-    -- look remains available; choosing a keyboard focus key restores RMB look.
-    local focusOwnsRMB = Settings.ShellRedirection
-        and Settings.ShellFocusKey == Enum.UserInputType.MouseButton2
-    return not focusOwnsRMB and UserInputService:GetFocusedTextBox() == nil
+    -- Redirection must not disable camera navigation. A separate keyboard
+    -- focus binding remains available when independent cursor aiming is wanted.
+    return UserInputService:GetFocusedTextBox() == nil
         and UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
 end
 
@@ -516,7 +514,7 @@ local function setFreecam(enabled)
             cam = workspace.CurrentCamera or cam
             cam.CameraType = Enum.CameraType.Scriptable
 
-            -- RMB belongs either to focus or camera look, never both.
+            -- RMB drag keeps camera navigation available in every aim mode.
             local looking = freecamMouseLookAllowed()
             local desiredMouseBehavior = looking and Enum.MouseBehavior.LockCenter or Enum.MouseBehavior.Default
             if UserInputService.MouseBehavior ~= desiredMouseBehavior then
@@ -670,7 +668,7 @@ do
                 "Align both axes only for a selected high-arc fallback. Direct shots keep normal tracking; some native modes require the gunner optic active.")
             local aimTarget = aimTab:Section({ Name = "Targeting", Side = 2 })
             settingToggle(aimTarget, "Shell Redirection", "ShellRedirection",
-                "Fire normally, then hold your lock key to steer an airborne shell. Pauses launch assists. RMB lock keeps the freecam cursor free: use arrow keys to look, or choose a keyboard lock key to retain RMB look.")
+                "Fire normally, then hold your lock key to steer an airborne shell. Pauses launch assists without disabling freecam RMB look. Choose a keyboard lock key for independent cursor aiming.")
             local lockKeyHandle
             lockKeyHandle = aimTarget:Label("Lock-on Key (Hold)"):AddKeybind({
                 Flag = "ALA_ShellFocusKey", Default = Settings.ShellFocusKey, Mode = "Hold",
@@ -1401,6 +1399,7 @@ if not original then return end
 local oldStatus = actor:GetAttribute("AttributeShellRedirectStatus")
 local cached, connections = {},{}
 local ownSeenAt = -math.huge
+local shotWakeUntil = -math.huge
 local startupAt = os.clock()
 local function sampleTarget()
     if cached.Owner~=owner or cached.Held~=true or type(cached.TargetId)~="number" then
@@ -1436,22 +1435,33 @@ for _, key in ipairs({"Owner","Held","Heartbeat","TargetId","Shot","Initializing
     cached[key] = player:GetAttribute(attribute)
     connections[#connections+1] = player:GetAttributeChangedSignal(attribute):Connect(function()
         local ok,value=pcall(player.GetAttribute,player,attribute)
-        if ok then cached[key]=value else cached.Error=tostring(value) end
-        if key~="Heartbeat" and key~="Initializing" then refreshTarget() end
+        if not ok then cached.Error=tostring(value);return end
+        local previous=cached[key]
+        cached[key]=value
+        -- Target acquisition fans out to every Actor. Keep these callbacks to
+        -- cached values only; idle hover must never resolve/read a character.
+        if key=="Owner" or key=="TargetId" or key=="Held" or (key=="Initializing" and value==true) then
+            cached.Position,cached.Velocity,cached.SampledAt=nil,nil,nil
+            if key=="Owner" or key=="TargetId" then
+                cached.Part,cached.Target,cached.Character,cached.Humanoid=nil,nil,nil,nil
+            end
+        elseif key=="Shot" and cached.Initializing~=true and type(previous)=="number"
+            and type(value)=="number" and value>previous then
+            shotWakeUntil=os.clock()+0.15
+        end
     end)
 end
-refreshTarget()
 local wrapper
 wrapper = function(state, ...)
-    -- Instance access belongs to the signal callbacks, never the native
-    -- per-projectile hot path. Only the simulation table is touched here.
+    -- Observe own flight activity before lock-on, but keep all target Instance
+    -- access in the owned monitor, never these native simulation callbacks.
     if type(state)=="table" and state.replicate==true and state.Behavior=="Default"
         and not state.destroy and not state.hitray and not state.physicalprojectile
-        and cached.Owner==owner and cached.Held==true and cached.Initializing~=true and not cached.Error
     then
         local now=os.clock()
         ownSeenAt=now
-        if type(cached.Heartbeat)=="number" and now-cached.Heartbeat<0.75
+        if cached.Owner==owner and cached.Held==true and cached.Initializing~=true and not cached.Error
+            and type(cached.Heartbeat)=="number" and now-cached.Heartbeat<0.75
             and cached.Position and cached.Velocity and now-(cached.SampledAt or -math.huge)<0.15 then
             -- Actor-local sampling avoids moving Vector3 broadcasts and smooths
             -- target motion between samples without touching Instances here.
@@ -1480,9 +1490,12 @@ task.spawn(function()
         if cached.Initializing==true then
             if now-startupAt>=8 then break end
         elseif now-cached.Heartbeat>=0.75 then break end
-        local sampling=cached.Held and cached.TargetId and os.clock()-ownSeenAt<0.15
+        local armed=cached.Held==true and type(cached.TargetId)=="number" and cached.Initializing~=true
+        local sampling=armed and (now-ownSeenAt<0.15 or now<shotWakeUntil)
         if sampling then refreshTarget() end
-        task.wait(sampling and 1/30 or 0.1)
+        -- Held acquisition stays responsive, but only flying/confirmed shots
+        -- cause target reads. Other Actors merely check their cached flags.
+        task.wait(cached.Held and 1/30 or 0.1)
     end
     if env.simulatebullet==wrapper then env.simulatebullet=original end
     for _, connection in ipairs(connections) do connection:Disconnect() end
@@ -4352,9 +4365,8 @@ _G.AutoLeadAssistDiagnostics = function()
             launchAssistsSuspended = Settings.ShellRedirection,
             held = shellRedirection.held, engaged = shellRedirection.isEngaged() == true,
             focusedPlayer = shellRedirection.focused and shellRedirection.focused.Name or nil,
-            transport = "actor-local target sampling",
-            freecamRmbOwner = Settings.ShellRedirection and Settings.ShellFocusKey==Enum.UserInputType.MouseButton2
-                and "target lock" or "camera look",
+            transport = "flight-gated actor-local target sampling",
+            freecamRmbOwner = "camera look",
             updateMs = shellRedirection.updateMs,
             readyActors = shellRedirection.ready or 0, error = shellRedirection.error,
             focusScans = shellRedirection.focusScans, focusRays = shellRedirection.focusRays,

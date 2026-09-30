@@ -1,10 +1,10 @@
--- Exercise the production RMB ownership helper without a live Roblox client.
+-- Exercise the production RMB navigation helper without a live Roblox client.
 return function(source, returnFixture)
     local first = assert(source:find('local function freecamMouseLookAllowed()', 1, true))
     local last = assert(source:find('local function setFreecam(', first, true))
     local helper = source:sub(first, last - 1)
     assert(source:find('local looking = freecamMouseLookAllowed()', last, true),
-        'freecam camera loop must use the tested RMB ownership helper')
+        'freecam camera loop must use the tested RMB navigation helper')
     local code = [[
 local passed = 0
 local function check(value, label) assert(value, label); passed += 1 end
@@ -20,13 +20,13 @@ local UserInputService = {
     end
 }
 ]] .. helper .. [[
-check(not freecamMouseLookAllowed(), "RMB focus owns input; camera look stays off and cursor stays free")
-check(mouseReads == 0, "RMB focus short-circuits the camera mouse-read path")
+check(freecamMouseLookAllowed(), "RMB focus does not disable freecam camera movement")
+check(mouseReads == 1, "RMB focus still polls camera look input")
 Settings.ShellFocusKey = Enum.KeyCode.F
 check(freecamMouseLookAllowed(), "keyboard focus leaves RMB available for camera rotation")
 Settings.ShellFocusKey = Enum.UserInputType.MouseButton2
 Settings.ShellRedirection = false
-check(freecamMouseLookAllowed(), "disabling redirection restores normal RMB camera look")
+check(freecamMouseLookAllowed(), "disabled redirection retains normal RMB camera look")
 textbox = {}
 check(not freecamMouseLookAllowed(), "typing prevents camera look")
 textbox = nil

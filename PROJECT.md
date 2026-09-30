@@ -2,7 +2,21 @@
 
 ## 1. Overview
 
+### Idle-focus Actor isolation and restored freecam look (2026-09-29)
+
+The user repeated the test in a clean session without autoexec and still reported substantial redirection stutter. A read-only capture with six ready Actors, no tracked shell and visibility checks off finally reproduced long frames: released frames averaged 19.02 ms (29.95 ms maximum); 214 held-target frames averaged 26.12 ms, including eight frames above 50 ms and a 254.75 ms maximum. Acquisition included a 231.60 ms frame; one held-empty frame reached 312.65 ms. The complete ESP callback generally averaged about 1.8 ms while focused, though it also peaked at 41.85 ms. These are observations, not proof that any one component caused every pause.
+
+The previous change wrongly disabled RMB freecam look when redirection used RMB. Normal RMB camera-look is restored regardless of the redirection toggle; released RMB keeps the cursor movable. Arrow keys and configurable keyboard lock bindings remain available. Choosing a keyboard lock key separates focus from RMB camera rotation. Tests now explicitly require camera movement with redirection enabled; the input-ownership behavior described in the older section below is superseded.
+
+Actor target-change callbacks previously resolved/read the target character in every Actor even with no shell flying. They now only cache/invalidate identity and pose; no target lookup or pose read happens at installation or from attribute callbacks. The owned monitor alone samples a target when a recent eligible own-shell callback or increasing confirmed-shot counter warrants it. Native callbacks observe own-flight activity before the lock is held, preserving acquisition of already-flying shells. While held, the monitor checks cached flags at 30 Hz; idle hover does not resolve target Instances. Target/hold/owner loss immediately invalidates the pose, preventing steering toward the old target during acquisition. The startup lease and six-listener cleanup are retained. Diagnostics identify `flight-gated actor-local target sampling`.
+
+The Roblox inspection skill guided the live capture and a temporary focus-visual isolation test. The circle, tracer and focused Highlight were hidden without disabling redirection, then restored with a targeted read confirming restoration and backup removal. The user reported continued stutter without those visuals. The second timing window contained only released frames, so it does not quantify that report or establish the Actor path as the sole cause.
+
+Verification: full source compiled locally without execution; **196 assertions passed** (53 adaptive/native-fire, 136 redirection/transport, 7 freecam navigation). Added checks cover 100 idle identity/hold transitions with zero Actor target lookups/pose reads, no target access during setup, monitor-only confirmed-shot priming, acquisition after a shell is already flying, and immediate pose invalidation. No revised full live reload or shot was performed. Actual stutter reduction remains pending user reload and the same controlled test.
+
 ### Freecam input ownership and Actor startup lease (2026-09-29)
+
+The idle-focus isolation and camera-look restoration above supersede this section's RMB restriction. Its startup lease fix remains current.
 
 The latest identity-only transport was confirmed running, but the inspected client had already stopped redirection with `Projectile Actors did not confirm steering access`, zero ready Actors and no ownership/status attributes. Freecam was active, zoom was off, and there were no tracked shells. This snapshot cannot establish that active shell steering caused the remaining stutter. The client then reconnected into a new session without the script loaded, preventing a controlled live comparison.
 
@@ -30,7 +44,7 @@ Verification: full-source local compilation succeeded and **159 assertions** pas
 
 The identity-only transport above supersedes this revision's per-target Position/Velocity attribute listeners; its input and native-launch behavior remain current.
 
-**Aim → Targeting → Lock-on Key (Hold)** now chooses the redirection activation key. RMB remains the initial binding; **Reset Lock Key to RMB** restores it. Valid bindings are remembered across reloads. The control always uses hold mode: release, window focus loss, typing, or changing the binding clears engagement. UI-consumed input cannot engage it. With the input-ownership correction above, RMB focus keeps the freecam cursor free; choose a separate keyboard lock key to use RMB for camera look.
+**Aim → Targeting → Lock-on Key (Hold)** now chooses the redirection activation key. RMB remains the initial binding; **Reset Lock Key to RMB** restores it. Valid bindings are remembered across reloads. The control always uses hold mode: release, window focus loss, typing, or changing the binding clears engagement. UI-consumed input cannot engage it. RMB camera-look remains available with redirection enabled; choose a separate keyboard lock key for independent focus/cursor aiming.
 
 **Target Visibility Check** is optional and initially off. Off selects the nearest living enemy projected inside the focus circle without sightline rays or rebuilding map ray filters. On retains the bounded four-candidate visibility check. Focus acquisition stays capped at 20 Hz, while a separate 2 Hz player roster reuses existing character records. Death, team changes, respawns and leaving the circle are validated each frame. Removing target visibility checks does not remove native shell collisions.
 

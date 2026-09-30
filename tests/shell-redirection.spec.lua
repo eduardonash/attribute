@@ -159,6 +159,15 @@ local actorAttrs={}
 local actor={Parent=true,GetAttribute=function(_,k)return actorAttrs[k]end,SetAttribute=function(_,k,v)actorAttrs[k]=v end}
 local actorTarget=record(202)
 local actorPosition,poseReads=target,0
+local targetLookups=0
+local findActorPart=actorTarget.character.FindFirstChild
+local findActorHumanoid=actorTarget.character.FindFirstChildOfClass
+actorTarget.character.FindFirstChild=function(...)
+    targetLookups+=1;return findActorPart(...)
+end
+actorTarget.character.FindFirstChildOfClass=function(...)
+    targetLookups+=1;return findActorHumanoid(...)
+end
 actorTarget.part.Position=nil
 setmetatable(actorTarget.part,{__index=function(_,key)
     if key=="Position" then poseReads+=1;return actorPosition end
@@ -166,7 +175,9 @@ end,__newindex=function(self,key,value)
     if key=="Position" then actorPosition=value else rawset(self,key,value)end
 end})
 Players.LocalPlayer=lp
-Players.GetPlayerByUserId=function(_,id)if id==202 then return actorTarget.player end end
+Players.GetPlayerByUserId=function(_,id)
+    targetLookups+=1;if id==202 then return actorTarget.player end
+end
 local game={GetService=function(_,name)
     if name=="Players" then return Players end
     return {PHRST={Threads={FindFirstChild=function()return actor end}}}
@@ -184,6 +195,9 @@ local task={spawn=function(fn)cleanup=fn end,wait=function()coroutine.yield("wai
     code=code..actorSource..[[
 check(environment.simulatebullet~=original and actorAttrs.AttributeShellRedirectStatus=="fixture","Actor environment hook confirms installation")
 lp:SetAttribute("AttributeShellRedirectTargetId",202)
+lp:SetAttribute("AttributeShellRedirectHeld",false)
+lp:SetAttribute("AttributeShellRedirectHeld",true)
+check(targetLookups==0 and poseReads==0,"Actor startup and idle acquisition callbacks perform zero target Instance lookups")
 local monitor=coroutine.create(cleanup)
 actorTime=2
 check(coroutine.resume(monitor) and coroutine.status(monitor)=="suspended"
@@ -191,21 +205,41 @@ check(coroutine.resume(monitor) and coroutine.status(monitor)=="suspended"
     "initializing Actor survives serial installation beyond the steady-state lease")
 lp:SetAttribute("AttributeShellRedirectHeartbeat",actorTime)
 lp:SetAttribute("AttributeShellRedirectShot",1)
+cached.Position,cached.Velocity,cached.SampledAt=target,Vector3.zero,actorTime
 s=state();environment.simulatebullet(s)
 check(s.velocity==Vector3.xAxis*100,"initializing Actor does not steer shells before host is ready")
+cached.Position,cached.Velocity,cached.SampledAt=nil,nil,nil
+check(coroutine.resume(monitor) and targetLookups==0 and poseReads==0,
+    "initializing monitor does not sample targets even after observing an own shell")
 calls=0
 lp:SetAttribute("AttributeShellRedirectHeartbeat",actorTime)
 lp:SetAttribute("AttributeShellRedirectInitializing",false)
+actorTime+=0.16
+lp:SetAttribute("AttributeShellRedirectHeartbeat",actorTime)
 check(coroutine.resume(monitor) and coroutine.status(monitor)=="suspended",
     "fresh post-install heartbeat starts the steady-state Actor lease")
 local poseReadsBefore=poseReads
 for i=1,10 do check(coroutine.resume(monitor),"idle Actor monitor remains scheduled")end
-check(poseReads==poseReadsBefore,"hovering with no own shell performs no repeated Actor pose sampling")
+check(poseReads==poseReadsBefore and targetLookups==0,"hovering with no own shell performs no Actor target lookups or pose sampling")
+for i=1,100 do
+    lp:SetAttribute("AttributeShellRedirectTargetId",nil)
+    lp:SetAttribute("AttributeShellRedirectTargetId",202)
+    lp:SetAttribute("AttributeShellRedirectHeld",false)
+    lp:SetAttribute("AttributeShellRedirectHeld",true)
+end
+check(coroutine.resume(monitor) and targetLookups==0 and poseReads==poseReadsBefore,
+    "repeated idle focus and hold transitions never resolve or sample target Instances")
 s=state()
-local results=table.pack(environment.simulatebullet(s))
-check(s.velocity.Y>99 and calls==1,"wrapper steers before native simulation display")
-check(results.n==3 and results[1]=="native" and results[3]==42,"native return values preserved")
 local readsBefore=attributeReads
+local results=table.pack(environment.simulatebullet(s))
+check(s.velocity==Vector3.xAxis*100 and targetLookups==0 and poseReads==poseReadsBefore,
+    "first own callback only records flight activity without target Instance access")
+check(results.n==3 and results[1]=="native" and results[3]==42,"native return values preserved")
+check(coroutine.resume(monitor),"owned monitor samples after genuine own flight activity")
+s=state();environment.simulatebullet(s)
+check(s.velocity.Y>99 and calls==2,"wrapper steers from monitor cache before native simulation display")
+check(attributeReads==readsBefore,"own flight activity does not add Instance attribute reads")
+readsBefore=attributeReads
 for i=1,100 do local foreign=state();foreign.replicate=false;environment.simulatebullet(foreign) end
 check(attributeReads==readsBefore,"other players' shells require no Actor attribute reads")
 readsBefore=attributeReads
@@ -216,6 +250,27 @@ check(coroutine.resume(monitor),"Actor-local monitor runs independently")
 s=state();environment.simulatebullet(s)
 check(s.velocity.Y>99 and not attrs.AttributeShellRedirectPosition and not attrs.AttributeShellRedirectVelocity,
     "Actor follows target movement without cross-Actor pose attributes")
+actorTime+=0.16
+lp:SetAttribute("AttributeShellRedirectHeartbeat",actorTime)
+local lookupsBefore=targetLookups
+local poseReadsBefore=poseReads
+lp:SetAttribute("AttributeShellRedirectShot",2)
+check(targetLookups==lookupsBefore and poseReads==poseReadsBefore,
+    "confirmed Shot wake callback never reads target Instances")
+check(coroutine.resume(monitor) and poseReads>poseReadsBefore,
+    "confirmed Shot wake lets owned monitor prime target before the next own callback")
+s=state();environment.simulatebullet(s)
+check(s.velocity.Y>99,"confirmed Shot cache steers its next native simulation step")
+lookupsBefore=targetLookups;poseReadsBefore=poseReads
+lp:SetAttribute("AttributeShellRedirectTargetId",nil)
+s=state();environment.simulatebullet(s)
+check(s.velocity==Vector3.xAxis*100,"target identity loss immediately prevents stale target steering")
+lp:SetAttribute("AttributeShellRedirectTargetId",202)
+check(targetLookups==lookupsBefore and poseReads==poseReadsBefore,
+    "retargeting an already-flying shell does no target reads in attribute callbacks")
+check(coroutine.resume(monitor),"monitor samples new focus for an already-flying own shell")
+s=state();environment.simulatebullet(s)
+check(s.velocity.Y>99,"already-flying own shell redirects after deferred focus sampling")
 actorTarget.humanoid.Health=0;check(coroutine.resume(monitor),"Actor monitor updates liveness")
 s=state();environment.simulatebullet(s)
 check(s.velocity==Vector3.xAxis*100,"Actor-local target death stops steering")
@@ -224,6 +279,9 @@ lp:SetAttribute("AttributeShellRedirectHeld",false)
 s=state();environment.simulatebullet(s)
 check(s.velocity==Vector3.xAxis*100,"Actor hold gate immediately prevents steering")
 lp:SetAttribute("AttributeShellRedirectHeld",true)
+check(coroutine.resume(monitor),"monitor can acquire while a previously unlocked own shell is still flying")
+s=state();environment.simulatebullet(s)
+check(s.velocity.Y>99,"locking after normal own flight still redirects without callback target reads")
 shellRedirection.active=true;shellRedirection.owner="fixture"
 shellRedirection.inputEnded(rmb)
 check(not shellRedirection.held and not shellRedirection.focused and attrs.AttributeShellRedirectHeld==false
