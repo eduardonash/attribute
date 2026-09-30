@@ -168,6 +168,7 @@ local emitted=table.pack(module:FireBullet(packet))
 check(packet.directions[1]==bore,"redirection preserves native projectile launch packet")
 check(emitted.n==3 and emitted[1]=="emitted" and emitted[3]==7,"native FireBullet returns preserved")
 check(shotTracker.serial==1 and shotTracker.queue[1].redirectionFlight,"confirmed own launch still queued for shell ESP without forecast")
+check(shellRedirection.shotSerial==1,"only confirmed native launch emits Actor sampler wake pulse")
 Settings.ShellRedirection=false;refreshAimCache()
 check(solves>solvesBefore and isAdaptiveAimActive(),"turning redirection off restores previous assist settings")
 activeWeapon=nil

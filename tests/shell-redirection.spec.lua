@@ -17,11 +17,13 @@ local shellRedirection={players={},records={},candidates={},held=true,heldKey=Se
 local Players={}
 local attrs={AttributeShellRedirectOwner="fixture",AttributeShellRedirectHeartbeat=os.clock(),AttributeShellRedirectHeld=true}
 local attributeReads=0
+local attributeWrites={}
 local attributeSignals={}
 local attributeDisconnects=0
 local lp={Team="blue",Parent=true,PlayerGui={},GetAttribute=function(_,k) attributeReads+=1;return attrs[k] end,
     SetAttribute=function(_,k,v)
         if attrs[k]==v then return end
+        attributeWrites[k]=(attributeWrites[k] or 0)+1
         attrs[k]=v
         for _,connection in ipairs(attributeSignals[k] or {}) do
             if connection.callback then connection.callback() end
@@ -51,7 +53,7 @@ local function record(x,team)
     local part={Parent=character,Position=Vector3.new(x,0,100),AssemblyLinearVelocity=Vector3.zero,
         IsA=function(_,class)return class=="BasePart" end,
         IsDescendantOf=function(_,model)return model==character end}
-    local player={Parent=Players,Team=team or "red",Neutral=false,Character=character}
+    local player={Parent=Players,UserId=x,Team=team or "red",Neutral=false,Character=character}
     local humanoid={Health=100,Parent=character}
     character.FindFirstChildOfClass=function()return humanoid end
     character.FindFirstChild=function(_,name)if name=="UpperTorso" then return part end end
@@ -152,8 +154,18 @@ check(not steer(s,nil,Vector3.zero),"lost focus leaves velocity alone")
 check(steer(s,target,Vector3.new(50,0,0)) and s.velocity.X>0,"moving focus receives lead")
 local actorAttrs={}
 local actor={Parent=true,GetAttribute=function(_,k)return actorAttrs[k]end,SetAttribute=function(_,k,v)actorAttrs[k]=v end}
+local actorTarget=record(202)
+local actorPosition,poseReads=target,0
+actorTarget.part.Position=nil
+setmetatable(actorTarget.part,{__index=function(_,key)
+    if key=="Position" then poseReads+=1;return actorPosition end
+end,__newindex=function(self,key,value)
+    if key=="Position" then actorPosition=value else rawset(self,key,value)end
+end})
+Players.LocalPlayer=lp
+Players.GetPlayerByUserId=function(_,id)if id==202 then return actorTarget.player end end
 local game={GetService=function(_,name)
-    if name=="Players" then return {LocalPlayer=lp} end
+    if name=="Players" then return Players end
     return {PHRST={Threads={FindFirstChild=function()return actor end}}}
 end}
 local calls=0
@@ -162,13 +174,17 @@ local environment={simulatebullet=original}
 local filtergc=function()return {original}end
 local getfenv=function()return environment end
 local cleanup
-local task={spawn=function(fn)cleanup=fn end,wait=function()error("unexpected fixture wait")end}
+local task={spawn=function(fn)cleanup=fn end,wait=function()coroutine.yield("wait")end}
 ]]
     actorSource=actorSource:gsub('@ACTOR@','"fixture"'):gsub('@OWNER@','"fixture"')
         :gsub('@STEER@',function()return steerSource end)
     code=code..actorSource..[[
 check(environment.simulatebullet~=original and actorAttrs.AttributeShellRedirectStatus=="fixture","Actor environment hook confirms installation")
-lp:SetAttribute("AttributeShellRedirectPosition",target);lp:SetAttribute("AttributeShellRedirectVelocity",Vector3.zero)
+lp:SetAttribute("AttributeShellRedirectTargetId",202)
+local monitor=coroutine.create(cleanup)
+local poseReadsBefore=poseReads
+for i=1,10 do check(coroutine.resume(monitor),"idle Actor monitor remains scheduled")end
+check(poseReads==poseReadsBefore,"hovering with no own shell performs no repeated Actor pose sampling")
 s=state()
 local results=table.pack(environment.simulatebullet(s))
 check(s.velocity.Y>99 and calls==1,"wrapper steers before native simulation display")
@@ -179,6 +195,15 @@ check(attributeReads==readsBefore,"other players' shells require no Actor attrib
 readsBefore=attributeReads
 for i=1,10 do environment.simulatebullet(state()) end
 check(attributeReads==readsBefore,"own shell hot path performs zero Instance attribute reads")
+actorTarget.part.Position=Vector3.new(20,200,0)
+check(coroutine.resume(monitor),"Actor-local monitor runs independently")
+s=state();environment.simulatebullet(s)
+check(s.velocity.Y>99 and not attrs.AttributeShellRedirectPosition and not attrs.AttributeShellRedirectVelocity,
+    "Actor follows target movement without cross-Actor pose attributes")
+actorTarget.humanoid.Health=0;check(coroutine.resume(monitor),"Actor monitor updates liveness")
+s=state();environment.simulatebullet(s)
+check(s.velocity==Vector3.xAxis*100,"Actor-local target death stops steering")
+actorTarget.humanoid.Health=100;check(coroutine.resume(monitor),"Actor-local sampling resumes valid target")
 lp:SetAttribute("AttributeShellRedirectHeld",false)
 s=state();environment.simulatebullet(s)
 check(s.velocity==Vector3.xAxis*100,"Actor hold gate immediately prevents steering")
@@ -186,16 +211,46 @@ lp:SetAttribute("AttributeShellRedirectHeld",true)
 shellRedirection.active=true;shellRedirection.owner="fixture"
 shellRedirection.inputEnded(rmb)
 check(not shellRedirection.held and not shellRedirection.focused and attrs.AttributeShellRedirectHeld==false
-    and attrs.AttributeShellRedirectPosition==nil,"RMB release immediately clears published target")
+    and attrs.AttributeShellRedirectTargetId==nil,"RMB release immediately clears published target identity")
 shellRedirection.inputBegan(rmb,false);shellRedirection.release()
 check(not shellRedirection.isEngaged(),"focus-loss release cancels held input")
 shellRedirection.active=false
 lp:SetAttribute("AttributeShellRedirectOwner",nil)
 s=state();environment.simulatebullet(s)
 check(s.velocity==Vector3.xAxis*100,"disabled owner stops steering immediately")
-cleanup()
+check(coroutine.resume(monitor) and coroutine.status(monitor)=="dead","Actor monitor terminates on owner loss")
 check(environment.simulatebullet==original and actorAttrs.AttributeShellRedirectStatus==nil,"cleanup restores owned callback/status")
 check(attributeDisconnects==5,"Actor cleanup disconnects all target attribute listeners")
+]]
+    code=code..[[
+local publicationTime=1
+local os={clock=function()return publicationTime end}
+]]..section('function shellRedirection.update(', 'function shellRedirection.assign(')..[[
+shellRedirection.active=true;shellRedirection.owner="fixture"
+shellRedirection.actors={actor};shellRedirection.ready=1;shellRedirection.installAt=1
+actorAttrs.AttributeShellRedirectStatus="fixture"
+lp:SetAttribute("AttributeShellRedirectOwner","fixture")
+shellRedirection.held=true;shellRedirection.heldKey=Settings.ShellFocusKey
+shellRedirection.focused=actorTarget.player;shellRedirection.focusedRecord=actorTarget
+shellRedirection.update()
+check(attrs.AttributeShellRedirectTargetId==202,"host publishes only focused player identity")
+local identityWrites=attributeWrites.AttributeShellRedirectTargetId
+local heartbeats=attributeWrites.AttributeShellRedirectHeartbeat or 0
+for i=1,120 do
+    publicationTime=1+(i-1)/120
+    actorTarget.part.Position=Vector3.new(i,200,0)
+    shellRedirection.update()
+end
+check(attributeWrites.AttributeShellRedirectTargetId==identityWrites,"moving target causes zero repeated identity broadcasts")
+check(not attributeWrites.AttributeShellRedirectPosition and not attributeWrites.AttributeShellRedirectVelocity,
+    "host never publishes moving Vector3 pose attributes")
+check((attributeWrites.AttributeShellRedirectHeartbeat or 0)-heartbeats<=4,"ownership heartbeat is bounded to four updates per second")
+local wakeWrites=attributeWrites.AttributeShellRedirectShot
+shellRedirection.shotSerial=1;shellRedirection.update();shellRedirection.update()
+check(attributeWrites.AttributeShellRedirectShot==wakeWrites+1,"confirmed shot changes wake attribute only once")
+shellRedirection.release()
+check(not attrs.AttributeShellRedirectHeld and not attrs.AttributeShellRedirectTargetId,"release clears hold and identity outside publication timer")
+shellRedirection.active=false
 ]]
     code=code..[[
 local created={}
@@ -228,7 +283,8 @@ check(#created==count,"visuals reused rather than rebuilt per frame")
 check(shellRedirection.visualWrites==writes,"stationary focus performs no repeated Highlight or GUI writes")
 Settings.ShellFocusTracer=false;Settings.ShellFocusHighlight=false
 shellRedirection.draw(camera,pixel)
-check(not visuals.tracer.Visible and not visuals.highlight.Enabled,"visual toggles independent")
+check(not visuals.tracer.Visible and not visuals.highlight.Enabled and not visuals.highlight.Adornee,
+    "disabled Highlight does not retain a target binding")
 Settings.ShellFocusTracer=true;Settings.ShellFocusHighlight=true
 b.part.Position=Vector3.new(20,0,-1)
 shellRedirection.draw(camera,pixel)
@@ -250,7 +306,8 @@ local function refreshAimFilters()end
 local function getActiveTank()return nil end
 local freecamActive=false
 camera.ViewportPointToRay=function()return {Origin=Vector3.zero}end
-shellRedirection.update=function()end
+local renderPublishes=0
+shellRedirection.update=function()renderPublishes+=1 end
 shellRedirection.refreshPlayers=function()end
 ]]..section('function shellRedirection.frame(', 'function shellRedirection.destroy(')..[[
 Settings.ShellRedirection=true;Settings.AimSource="Camera"
@@ -267,6 +324,7 @@ local scans=shellRedirection.focusScans-scansBefore
 check(scans>0 and scans<=20,"120 render frames perform at most 20 acquisition scans")
 check(shellRedirection.focusRays-raysBefore<=20,"stable visible focus raycasts are rate limited")
 check(shellRedirection.focused==b.player and visuals.tracer.Visible,"throttled focus retains live target cues")
+check(renderPublishes==0,"camera render callback performs no Actor publications")
 Settings.ShellVisibilityCheck=false;simTime+=0.051
 local beforeRay=rayCount
 for i=1,120 do simTime+=1/120;shellRedirection.frame(camera) end
@@ -290,10 +348,10 @@ check(not shellRedirection.focused and not visuals.tracer.Visible,"RMB release r
         ..section('function shellRedirection.destroy(', '-- Prefer vehicles/characters')..[[
 local disconnected=0
 local connection={Disconnect=function()disconnected+=1 end}
-shellRedirection.began=connection;shellRedirection.ended=connection;shellRedirection.focusLost=connection
+shellRedirection.began=connection;shellRedirection.ended=connection;shellRedirection.focusLost=connection;shellRedirection.tick=connection
 Settings.ShellRedirection=true
 shellRedirection.destroy()
-check(disconnected==3 and visuals.gui.destroyed and visuals.highlight.destroyed and not shellRedirection.visuals,
+check(disconnected==4 and visuals.gui.destroyed and visuals.highlight.destroyed and not shellRedirection.visuals,
     "unload removes owned input handlers and visual objects")
 check(shellRedirection.destroyed and not shellRedirection.isEngaged() and Settings.ShellRedirection,
     "unload prevents reengagement without changing remembered toggle")

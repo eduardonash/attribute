@@ -2,7 +2,19 @@
 
 ## 1. Overview
 
+### Focus-hover stutter: identity-only transport (2026-09-29)
+
+Follow-up inspection confirmed the previous revision running with six projectile Actors, visibility checks/pre-shot previews off and no tracked shell. The user reported screen/camera/cursor stutter rather than shell motion; disabling the focused Highlight did not resolve it. A focused 360-frame sample averaged 12.24 ms, peaked at 26.93 ms and contained no >50 ms frame, with a 0.06 ms focus callback snapshot. These samples did not reproduce a long frame pause and do not disprove the reported hitch. The remaining moving-target attribute fan-out was removed as an isolation/performance change, not declared the proven sole cause.
+
+The host now publishes only `TargetId` when focus changes, `Held` on engagement changes, a `Shot` wake counter after confirmed native dispatch, and an ownership heartbeat at at most 4 Hz. No moving Position/Velocity Vector3 attributes are published. Publication/installation/status work runs on an owned Heartbeat connection, never the camera render callback. Unload disconnects that connection with the three input handlers. The disabled focused Highlight also keeps its Adornee unset.
+
+Each Actor resolves the focused player's torso locally. Its monitor samples motion at 30 Hz only while qualifying own-shell callbacks have been seen within the last 0.15 seconds; merely hovering over a moving player does not repeatedly sample its pose. Focus changes and confirmed-shot wake signals refresh the cache once. Native steering uses the local cache with up to 0.1-second velocity extrapolation and refuses poses older than 0.15 seconds. Native callbacks still perform no Instance operations, preserve original returns/speed/collision handling and stop on release/lost ownership/stale heartbeat. Five owned identity/hold/heartbeat/shot listeners are disconnected on cleanup. `shellRedirection.transport` and `updateMs` identify and time the new path. Saved keybind, independent visuals and launch-assist suspension remain unchanged.
+
+Verification: full-source local compilation succeeded and **159 assertions** passed (53 adaptive/native-fire and 106 redirection/render/transport checks). Added checks cover zero repeated moving-target identity/pose broadcasts, no repeated idle Actor pose sampling, Actor-local motion/death tracking, confirmed-shot wake deduplication, at most four heartbeat updates per second, no render-time publications and complete Heartbeat/listener cleanup. Read-only Roblox inspection informed this change; no revised full reload or real shot was executed by the agent. Actual reduction of the reported screen hitch and live Actor scheduling remain pending user retest.
+
 ### Native-launch redirection mode and configurable lock key (2026-09-29)
+
+The identity-only transport above supersedes this revision's per-target Position/Velocity attribute listeners; its input and native-launch behavior remain current.
 
 **Aim → Targeting → Lock-on Key (Hold)** now chooses the redirection activation key. RMB remains the initial binding; **Reset Lock Key to RMB** restores it. Valid bindings are remembered across reloads. The control always uses hold mode: release, window focus loss, typing, or changing the binding clears engagement. UI-consumed input cannot engage it. Rebinding does not change freecam's independent RMB camera-look control; choose a separate keyboard key to lock without rotating freecam.
 
