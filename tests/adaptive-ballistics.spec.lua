@@ -1,6 +1,6 @@
 -- Call the returned function with attribute.lua's source in a Luau runtime
 -- providing Vector2, Vector3 and CFrame. No live scene, input or remotes used.
-return function(source)
+return function(source, returnFixture)
     local function section(first, last)
         local a = assert(string.find(source, first, 1, true), first)
         local b = assert(string.find(source, last, a, true), last)
@@ -157,5 +157,6 @@ return {passed=passed, sceneMutations=false}
         .. section("wh.fireWeapon = function", "local held = heldFire.matches")
         .. '\nreturn "native"\nend\n'
         .. assertions
+    if returnFixture then return fixture end
     return assert(loadstring(fixture, "adaptive-ballistics.spec"))()
 end

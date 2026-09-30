@@ -1,5 +1,5 @@
 -- Extract production steering and selection into mock scene/Actor fixtures.
-return function(source)
+return function(source, returnFixture)
     local function section(first,last)
         local a=assert(source:find(first,1,true))
         local b=assert(source:find(last,a,true))
@@ -10,27 +10,43 @@ return function(source)
     local code=[[
 local passed=0
 local function check(value,label) assert(value,label);passed+=1 end
-local Settings={ShellRedirection=true,ShellFocusRadius=60}
-local shellRedirection={players={},candidates={}}
+local Settings={ShellRedirection=true,ShellFocusRadius=60,ShellFocusCircle=true,ShellFocusTracer=true,
+    ShellFocusHighlight=true,ShellFocusColor=Color3.fromRGB(255,209,90)}
+local shellRedirection={players={},candidates={},held=true}
 local Players={}
-local attrs={AttributeShellRedirectOwner="fixture",AttributeShellRedirectHeartbeat=os.clock()}
-local lp={Team="blue",Parent=true,GetAttribute=function(_,k) return attrs[k] end}
+local attrs={AttributeShellRedirectOwner="fixture",AttributeShellRedirectHeartbeat=os.clock(),AttributeShellRedirectHeld=true}
+local lp={Team="blue",Parent=true,PlayerGui={},GetAttribute=function(_,k) return attrs[k] end,
+    SetAttribute=function(_,k,v)attrs[k]=v end}
+local textbox=nil
+local UserInputService={GetFocusedTextBox=function()return textbox end}
 local aimWorldParams={}
 local blocked,rayCount={},0
 local workspace={Raycast=function(_,origin,delta)
     rayCount+=1
     if blocked[delta.X] then return {Instance={IsDescendantOf=function() return false end}} end
 end}
-local camera={WorldToViewportPoint=function(_,p) return p,p.X<1000 end}
+local camera={ViewportSize=Vector2.new(1280,720),WorldToViewportPoint=function(_,p) return p,p.X<1000 end}
 local function record(x,team)
     local character={}
-    local part={Parent=character,Position=Vector3.new(x,0,100),AssemblyLinearVelocity=Vector3.zero}
+    local part={Parent=character,Position=Vector3.new(x,0,100),AssemblyLinearVelocity=Vector3.zero,
+        IsDescendantOf=function(_,model)return model==character end}
     local player={Parent=Players,Team=team or "red",Neutral=false,Character=character}
     return {player=player,character=character,part=part,humanoid={Health=100}}
 end
-]]..section('function shellRedirection.select(', '-- Runs inside each native projectile Actor')..steerSource..[[
+]]..section('function shellRedirection.isEngaged(', '-- Runs inside each native projectile Actor')..steerSource..[[
 local a,b=record(10),record(20)
 shellRedirection.players={a,b}
+local rmb={UserInputType=Enum.UserInputType.MouseButton2}
+shellRedirection.release()
+check(not shellRedirection.select(camera,Vector2.zero,Vector3.zero),"RMB released cannot focus")
+shellRedirection.inputBegan(rmb,true)
+check(not shellRedirection.held,"processed UI click cannot engage")
+textbox={};shellRedirection.inputBegan(rmb,false)
+check(not shellRedirection.held,"typing cannot engage")
+textbox=nil;shellRedirection.inputBegan(rmb,false)
+check(shellRedirection.isEngaged(),"RMB hold engages redirection")
+shellRedirection.inputEnded({UserInputType=Enum.UserInputType.MouseButton1})
+check(shellRedirection.isEngaged(),"other button release keeps RMB hold")
 local pos=shellRedirection.select(camera,Vector2.zero,Vector3.zero)
 check(pos==a.part.Position and shellRedirection.focused==a.player,"nearest visible enemy selected")
 blocked[10]=true
@@ -101,12 +117,79 @@ s=state()
 local results=table.pack(environment.simulatebullet(s))
 check(s.velocity.Y>99 and calls==1,"wrapper steers before native simulation display")
 check(results.n==3 and results[1]=="native" and results[3]==42,"native return values preserved")
+attrs.AttributeShellRedirectHeld=false
+s=state();environment.simulatebullet(s)
+check(s.velocity==Vector3.xAxis*100,"Actor hold gate immediately prevents steering")
+attrs.AttributeShellRedirectHeld=true
+shellRedirection.active=true;shellRedirection.owner="fixture"
+shellRedirection.inputEnded(rmb)
+check(not shellRedirection.held and not shellRedirection.focused and attrs.AttributeShellRedirectHeld==false
+    and attrs.AttributeShellRedirectPosition==nil,"RMB release immediately clears published target")
+shellRedirection.inputBegan(rmb,false);shellRedirection.release()
+check(not shellRedirection.isEngaged(),"focus-loss release cancels held input")
+shellRedirection.active=false
 attrs.AttributeShellRedirectOwner=nil
 s=state();environment.simulatebullet(s)
 check(s.velocity==Vector3.xAxis*100,"disabled owner stops steering immediately")
 cleanup()
 check(environment.simulatebullet==original and actorAttrs.AttributeShellRedirectStatus==nil,"cleanup restores owned callback/status")
+]]
+    code=code..[[
+local created={}
+local Instance={new=function(class)
+    local object={ClassName=class,Destroy=function(self)self.destroyed=true end}
+    created[#created+1]=object
+    return object
+end}
+local THEME={TextPrimary=Color3.fromRGB(241,242,246)}
+]]..section('function shellRedirection.draw(', 'function shellRedirection.frame(')..[[
+shellRedirection.held=true;shellRedirection.focused=b.player;shellRedirection.focusedPart=b.part
+local pixel=Vector2.new(400,200)
+shellRedirection.draw(camera,pixel)
+local visuals=shellRedirection.visuals
+check(visuals.gui.IgnoreGuiInset and visuals.circle.Position.X.Offset==400 and visuals.circle.Position.Y.Offset==200,
+    "focus circle uses viewport coordinates")
+check(visuals.circle.Size.X.Offset==120 and visuals.circle.Size.Y.Offset==120 and visuals.stroke.Thickness==1,
+    "circle exactly matches focus radius with thin stroke")
+check(visuals.highlight.Enabled and visuals.highlight.Adornee==b.character and visuals.highlight.FillColor==Settings.ShellFocusColor,
+    "only focused character receives distinct color")
+check(visuals.tracer.Visible and visuals.tracer.Size.Y.Offset==1,"one thin target tracer")
+local start=Vector2.new(640,716)
+local finish=Vector2.new(20,0)
+check(math.abs(visuals.tracer.Size.X.Offset-(finish-start).Magnitude)<0.001,"tracer endpoints follow projection")
+local count=#created
+for i=1,20 do shellRedirection.draw(camera,pixel) end
+check(#created==count,"visuals reused rather than rebuilt per frame")
+Settings.ShellFocusTracer=false;Settings.ShellFocusHighlight=false
+shellRedirection.draw(camera,pixel)
+check(not visuals.tracer.Visible and not visuals.highlight.Enabled,"visual toggles independent")
+Settings.ShellFocusTracer=true;Settings.ShellFocusHighlight=true
+b.part.Position=Vector3.new(20,0,-1)
+shellRedirection.draw(camera,pixel)
+check(not visuals.tracer.Visible and not visuals.highlight.Enabled,"behind-camera target hidden")
+b.part.Position=Vector3.new(20,0,100)
+shellRedirection.draw(camera,pixel);shellRedirection.release()
+check(not visuals.tracer.Visible and not visuals.highlight.Enabled and not visuals.highlight.Adornee,"release removes target cues")
+shellRedirection.draw(camera,pixel)
+check(visuals.circle.Visible and not visuals.tracer.Visible,"idle circle remains without target tracer")
+textbox={};shellRedirection.draw(camera,pixel)
+check(not visuals.gui.Enabled,"typing hides focus visuals")
+textbox=nil;Settings.ShellRedirection=false;shellRedirection.draw(camera,pixel)
+check(not visuals.gui.Enabled and not visuals.highlight.Enabled,"disabled mode hides overlay and highlight")
+]]
+    code=code..section('function shellRedirection.stop(', 'function shellRedirection.update(')
+        ..section('function shellRedirection.destroy(', '-- Prefer vehicles/characters')..[[
+local disconnected=0
+local connection={Disconnect=function()disconnected+=1 end}
+shellRedirection.began=connection;shellRedirection.ended=connection;shellRedirection.focusLost=connection
+Settings.ShellRedirection=true
+shellRedirection.destroy()
+check(disconnected==3 and visuals.gui.destroyed and visuals.highlight.destroyed and not shellRedirection.visuals,
+    "unload removes owned input handlers and visual objects")
+check(shellRedirection.destroyed and not shellRedirection.isEngaged() and Settings.ShellRedirection,
+    "unload prevents reengagement without changing remembered toggle")
 return {passed=passed,sceneMutations=false}
 ]]
+    if returnFixture then return code end
     return assert(loadstring(code,"shell-redirection.spec"))()
 end

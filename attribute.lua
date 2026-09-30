@@ -21,7 +21,7 @@ local camera = workspace.CurrentCamera
 
 -- The settings menu belongs to VibeUI; this ScreenGui only owns the small
 -- bottom-left impact readout. Clear overlays from older script versions too.
-for _, guiName in ipairs({ "AutoLeadSettingsUI", "AutoLeadOverlay", "AttributeTankOverlay" }) do
+for _, guiName in ipairs({ "AutoLeadSettingsUI", "AutoLeadOverlay", "AttributeTankOverlay", "AttributeShellFocusOverlay" }) do
     local prev = lp:WaitForChild("PlayerGui"):FindFirstChild(guiName)
     if prev then prev:Destroy() end
     local prevCg = game:GetService("CoreGui"):FindFirstChild(guiName)
@@ -100,6 +100,11 @@ local Settings = {
     AdaptiveAim = adaptiveAim == true,
     ShellRedirection = rememberedSettings.ShellRedirection == true,
     ShellFocusRadius = math.clamp(tonumber(rememberedSettings.ShellFocusRadius) or 60, 5, 250),
+    ShellFocusCircle = rememberedSettings.ShellFocusCircle ~= false,
+    ShellFocusTracer = rememberedSettings.ShellFocusTracer ~= false,
+    ShellFocusHighlight = rememberedSettings.ShellFocusHighlight ~= false,
+    ShellFocusColor = typeof(rememberedSettings.ShellFocusColor) == "Color3" and rememberedSettings.ShellFocusColor
+        or Color3.fromRGB(255, 209, 90),
     ArtilleryAutoLay = rememberedSettings.ArtilleryAutoLay ~= false,
     InfiniteAmmo = rememberedSettings.InfiniteAmmo == true,
     TurretSpeedEnabled = rememberedSettings.TurretSpeedEnabled == true,
@@ -642,12 +647,17 @@ do
                 "Align both axes only for a selected high-arc fallback. Direct shots keep normal tracking; some native modes require the gunner optic active.")
             local aimTarget = aimTab:Section({ Name = "Targeting", Side = 2 })
             settingToggle(aimTarget, "Shell Redirection", "ShellRedirection",
-                "Experimental mid-air steering of your ordinary shells toward the visible enemy nearest the cursor. Requires projectile Actor access.")
+                "Hold RMB to steer airborne ordinary shells toward the focused enemy. Release RMB to stop steering. Requires projectile Actor access.")
             aimTarget:Slider({
                 Name = "Player Focus Radius", Flag = "ALA_ShellFocusRadius",
                 Min = 5, Max = 250, Default = Settings.ShellFocusRadius, Decimals = 1, Suffix = " px",
                 Callback = function(value) Settings.ShellFocusRadius = math.clamp(value, 5, 250) end
             })
+            settingToggle(aimTarget, "Focus FOV Circle", "ShellFocusCircle", "Thin circle showing the exact player focus radius.")
+            settingToggle(aimTarget, "Focused Player Tracer", "ShellFocusTracer", "One thin tracer from the screen bottom to the targeted player while holding RMB.")
+            settingToggle(aimTarget, "Focused Player Highlight", "ShellFocusHighlight", "Highlight only the targeted player in a distinct color while holding RMB.")
+            aimTarget:Label("Focused Player Color"):AddColorpicker({ Default = Settings.ShellFocusColor,
+                Flag = "ALA_ShellFocusColor", Callback = function(c) Settings.ShellFocusColor = c end })
             aimTarget:Dropdown({
                 Name = "Aim Source",
                 Flag = "ALA_AimSource",
@@ -1167,7 +1177,7 @@ end
 -- The target classes change much less often than the cursor. Cache only the
 -- raycast filters; the ray origin/direction and actual hit are still read every
 -- rendered frame so the preview does not lag behind mouse movement.
-local shellRedirection = { players = {}, candidates = {}, focused = nil }
+local shellRedirection = { players = {}, candidates = {}, focused = nil, held = false }
 local aimIncludeParams = RaycastParams.new()
 aimIncludeParams.FilterType = Enum.RaycastFilterType.Include
 aimIncludeParams.IgnoreWater = true
@@ -1218,9 +1228,35 @@ local function refreshAimFilters(veh)
     aimWorldParams.FilterDescendantsInstances = { veh, lp.Character }
 end
 
+function shellRedirection.isEngaged()
+    return Settings.ShellRedirection and shellRedirection.held and not shellRedirection.failed
+        and not shellRedirection.destroyed
+        and UserInputService:GetFocusedTextBox() == nil
+end
+function shellRedirection.release()
+    shellRedirection.held, shellRedirection.focused, shellRedirection.focusedPart = false,nil,nil
+    if shellRedirection.active and lp:GetAttribute("AttributeShellRedirectOwner")==shellRedirection.owner then
+        lp:SetAttribute("AttributeShellRedirectHeld",false)
+        lp:SetAttribute("AttributeShellRedirectPosition",nil)
+        lp:SetAttribute("AttributeShellRedirectVelocity",nil)
+    end
+    if shellRedirection.visuals then
+        shellRedirection.visuals.tracer.Visible = false
+        shellRedirection.visuals.highlight.Enabled = false
+        shellRedirection.visuals.highlight.Adornee = nil
+    end
+end
+function shellRedirection.inputBegan(input, processed)
+    if not processed and input.UserInputType==Enum.UserInputType.MouseButton2
+        and UserInputService:GetFocusedTextBox()==nil then shellRedirection.held=true end
+end
+function shellRedirection.inputEnded(input)
+    if input.UserInputType==Enum.UserInputType.MouseButton2 then shellRedirection.release() end
+end
 function shellRedirection.select(cam, pixel, origin)
     shellRedirection.focused = nil
-    if not Settings.ShellRedirection or shellRedirection.failed then return end
+    shellRedirection.focusedPart = nil
+    if not shellRedirection.isEngaged() then return end
     local candidates = shellRedirection.candidates
     table.clear(candidates)
     local radiusSquared = Settings.ShellFocusRadius * Settings.ShellFocusRadius
@@ -1248,6 +1284,7 @@ function shellRedirection.select(cam, pixel, origin)
         local hit = workspace:Raycast(origin,record.part.Position-origin,aimWorldParams)
         if not hit or hit.Instance:IsDescendantOf(record.character) then
             shellRedirection.focused = record.player
+            shellRedirection.focusedPart = record.part
             return record.part.Position, record.part.AssemblyLinearVelocity, record.part, Vector3.yAxis
         end
     end
@@ -1296,6 +1333,7 @@ local wrapper
 wrapper = function(state, ...)
     local heartbeat = player:GetAttribute("AttributeShellRedirectHeartbeat")
     if player:GetAttribute("AttributeShellRedirectOwner")==owner
+        and player:GetAttribute("AttributeShellRedirectHeld")==true
         and type(heartbeat)=="number" and os.clock()-heartbeat < 0.75 then
         local position = player:GetAttribute("AttributeShellRedirectPosition")
         local velocity = player:GetAttribute("AttributeShellRedirectVelocity")
@@ -1325,14 +1363,14 @@ task.spawn(function()
 end)
 ]=]
 shellRedirection.attributes = {"AttributeShellRedirectOwner","AttributeShellRedirectHeartbeat",
-    "AttributeShellRedirectPosition","AttributeShellRedirectVelocity"}
+    "AttributeShellRedirectPosition","AttributeShellRedirectVelocity","AttributeShellRedirectHeld"}
 function shellRedirection.stop()
     if shellRedirection.originalAttributes and lp:GetAttribute("AttributeShellRedirectOwner")==shellRedirection.owner then
         for _, key in ipairs(shellRedirection.attributes) do
             lp:SetAttribute(key,shellRedirection.originalAttributes[key])
         end
     end
-    shellRedirection.active, shellRedirection.focused = false,nil
+    shellRedirection.active, shellRedirection.focused, shellRedirection.focusedPart = false,nil,nil
     shellRedirection.ready = 0
     shellRedirection.originalAttributes = nil
 end
@@ -1378,6 +1416,12 @@ function shellRedirection.update()
             return
         end
     end
+    local engaged = shellRedirection.isEngaged() == true
+    if lp:GetAttribute("AttributeShellRedirectHeld")~=engaged then lp:SetAttribute("AttributeShellRedirectHeld",engaged) end
+    if not engaged then
+        lp:SetAttribute("AttributeShellRedirectPosition",nil)
+        lp:SetAttribute("AttributeShellRedirectVelocity",nil)
+    end
     if now-(shellRedirection.updated or 0)<0.05 then return end
     shellRedirection.updated = now
     local focused = shellRedirection.focused
@@ -1385,7 +1429,7 @@ function shellRedirection.update()
     local humanoid = character and character:FindFirstChildOfClass("Humanoid")
     local part = character and (character:FindFirstChild("UpperTorso") or character:FindFirstChild("Torso")
         or character:FindFirstChild("HumanoidRootPart"))
-    local valid = focused and focused.Parent==Players and humanoid and humanoid.Health>0 and part
+    local valid = engaged and focused and focused.Parent==Players and humanoid and humanoid.Health>0 and part
     lp:SetAttribute("AttributeShellRedirectPosition",valid and part.Position or nil)
     lp:SetAttribute("AttributeShellRedirectVelocity",valid and part.AssemblyLinearVelocity or nil)
     lp:SetAttribute("AttributeShellRedirectHeartbeat",now)
@@ -1405,12 +1449,104 @@ function shellRedirection.update()
     end
 end
 
+function shellRedirection.draw(cam, pixel)
+    local show = Settings.ShellRedirection and not shellRedirection.failed and UserInputService:GetFocusedTextBox()==nil
+    local visuals = shellRedirection.visuals
+    if not show then
+        if visuals then
+            visuals.gui.Enabled=false; visuals.tracer.Visible=false
+            visuals.highlight.Enabled=false; visuals.highlight.Adornee=nil
+        end
+        return
+    end
+    if not visuals then
+        visuals = {}
+        shellRedirection.visuals = visuals
+        visuals.gui = Instance.new("ScreenGui")
+        visuals.gui.Name="AttributeShellFocusOverlay"
+        visuals.gui.IgnoreGuiInset=true; visuals.gui.ResetOnSpawn=false
+        visuals.gui.DisplayOrder=999998
+        visuals.gui.Parent=lp.PlayerGui
+        visuals.circle=Instance.new("Frame")
+        visuals.circle.Name="FocusRadius"; visuals.circle.BackgroundTransparency=1
+        visuals.circle.AnchorPoint=Vector2.new(0.5,0.5); visuals.circle.BorderSizePixel=0
+        visuals.circle.Parent=visuals.gui
+        local corner=Instance.new("UICorner")
+        corner.CornerRadius=UDim.new(0.5,0); corner.Parent=visuals.circle
+        visuals.stroke=Instance.new("UIStroke")
+        visuals.stroke.Thickness=1; visuals.stroke.ApplyStrokeMode=Enum.ApplyStrokeMode.Border
+        visuals.stroke.Parent=visuals.circle
+        visuals.tracer=Instance.new("Frame")
+        visuals.tracer.Name="FocusedPlayerTracer"; visuals.tracer.BorderSizePixel=0
+        visuals.tracer.AnchorPoint=Vector2.new(0.5,0.5); visuals.tracer.BackgroundTransparency=0.18
+        visuals.tracer.Visible=false; visuals.tracer.Parent=visuals.gui
+        visuals.highlight=Instance.new("Highlight")
+        visuals.highlight.Name="AttributeFocusedPlayer"; visuals.highlight.Enabled=false
+        visuals.highlight.FillTransparency=0.85; visuals.highlight.OutlineTransparency=0.15
+        visuals.highlight.DepthMode=Enum.HighlightDepthMode.AlwaysOnTop
+        visuals.highlight.Parent=workspace
+    end
+    visuals.gui.Enabled=true
+    visuals.circle.Visible=Settings.ShellFocusCircle
+    visuals.circle.Position=UDim2.fromOffset(pixel.X,pixel.Y)
+    visuals.circle.Size=UDim2.fromOffset(Settings.ShellFocusRadius*2,Settings.ShellFocusRadius*2)
+    local engaged = shellRedirection.isEngaged()
+    local focused = engaged and shellRedirection.focused
+    local part = focused and shellRedirection.focusedPart
+    local point,visible
+    if part and part.Parent and focused.Character and part:IsDescendantOf(focused.Character) then
+        point,visible=cam:WorldToViewportPoint(part.Position)
+    end
+    local tracked = visible == true and point.Z>0
+    local color=Settings.ShellFocusColor
+    visuals.stroke.Color=tracked and color or THEME.TextPrimary
+    visuals.stroke.Transparency=engaged and 0.2 or 0.6
+    visuals.highlight.Enabled=tracked and Settings.ShellFocusHighlight
+    visuals.highlight.Adornee=tracked and focused.Character or nil
+    visuals.highlight.FillColor=color; visuals.highlight.OutlineColor=color
+    visuals.tracer.Visible=tracked and Settings.ShellFocusTracer
+    visuals.tracer.BackgroundColor3=color
+    if visuals.tracer.Visible then
+        local start=Vector2.new(cam.ViewportSize.X*0.5,cam.ViewportSize.Y-4)
+        local finish=Vector2.new(point.X,point.Y)
+        local delta=finish-start
+        visuals.tracer.Position=UDim2.fromOffset((start.X+finish.X)*0.5,(start.Y+finish.Y)*0.5)
+        visuals.tracer.Size=UDim2.fromOffset(delta.Magnitude,1)
+        visuals.tracer.Rotation=math.deg(math.atan2(delta.Y,delta.X))
+    end
+end
+function shellRedirection.frame(cam)
+    if shellRedirection.destroyed then return end
+    if not Settings.ShellRedirection and not shellRedirection.active and not shellRedirection.visuals
+        and not shellRedirection.failed then return end
+    local source = Settings.Freecam and freecamActive and "Mouse" or Settings.AimSource
+    local pixel = source=="Mouse" and UserInputService:GetMouseLocation() or cam.ViewportSize*0.5
+    if Settings.ShellRedirection and not shellRedirection.failed then
+        refreshAimFilters(getActiveTank())
+        local ray=cam:ViewportPointToRay(pixel.X,pixel.Y)
+        shellRedirection.select(cam,pixel,ray.Origin)
+    else
+        shellRedirection.focused, shellRedirection.focusedPart=nil,nil
+    end
+    shellRedirection.update()
+    shellRedirection.draw(cam,pixel)
+end
+function shellRedirection.destroy()
+    shellRedirection.destroyed=true
+    shellRedirection.release()
+    shellRedirection.stop()
+    for _, connection in ipairs({shellRedirection.began,shellRedirection.ended,shellRedirection.focusLost}) do
+        connection:Disconnect()
+    end
+    local visuals=shellRedirection.visuals
+    if visuals then visuals.highlight:Destroy(); visuals.gui:Destroy(); shellRedirection.visuals=nil end
+end
+
 -- Prefer vehicles/characters even behind scenery, then use the visible map
 -- point so shots at ground pixels have a finite ballistic target.
 local function getAimTarget(aimSource, veh)
     local cam = workspace.CurrentCamera
     local mouse = lp:GetMouse()
-    shellRedirection.focused = nil
     if not cam then return Vector3.new(0, 0, 0), Vector3.new(), nil, Vector3.new(0, 1, 0), Vector3.new(0, 0, -1) end
 
     -- Freecam left-click aims where the cursor points, regardless of the normal
@@ -1430,9 +1566,6 @@ local function getAimTarget(aimSource, veh)
         origin = cam.CFrame.Position
         direction = cam.CFrame.LookVector * 100000
     end
-
-    local focusPixel = aimSource == "Mouse" and UserInputService:GetMouseLocation() or cam.ViewportSize*0.5
-    shellRedirection.select(cam,focusPixel,origin)
 
     local ray = nil
     -- A freecam cursor selects the first visible world surface. The normal
@@ -2620,6 +2753,16 @@ RunService:BindToRenderStep("AttributePlayerESP", FREECAM_PRIORITY + 4, function
     local now = os.clock()
     local camera = workspace.CurrentCamera
     if not camera then return end
+    local focusOK,focusError=pcall(shellRedirection.frame,camera)
+    if not focusOK then
+        shellRedirection.error=tostring(focusError); shellRedirection.failed=true
+        pcall(shellRedirection.release); pcall(shellRedirection.stop)
+        if shellRedirection.visuals then shellRedirection.visuals.gui.Enabled=false end
+    end
+    if shellRedirection.error and shellRedirection.error~=shellRedirection.reportedError then
+        shellRedirection.reportedError=shellRedirection.error
+        extras.notify("Shell Redirection unavailable: "..shellRedirection.error)
+    end
     local origin = camera.CFrame.Position
     if now - lastPlayerScan >= 0.25 then
         lastPlayerScan = now
@@ -3322,7 +3465,6 @@ refreshAimCache = function()
             aimCache.targetPos = nil
             aimCache.clearance = false
             aimCache.fireBlock = "No active weapon"
-            shellRedirection.focused = nil
             aimCache.waitForAlignment, aimCache.solutionBlocked = false, false
             aimCache.reason = "no active weapon"
             return
@@ -3386,16 +3528,6 @@ refreshAimCache = function()
         aimCache.previewDirection = nil
         aimCache.waitForAlignment, aimCache.solutionBlocked = false, false
         aimCache.reason = tostring(err)
-    end
-    local redirectOK,redirectError = pcall(shellRedirection.update)
-    if not redirectOK then
-        shellRedirection.error = tostring(redirectError)
-        shellRedirection.failed = true
-        pcall(shellRedirection.stop)
-    end
-    if shellRedirection.error and shellRedirection.error~=shellRedirection.reportedError then
-        shellRedirection.reportedError = shellRedirection.error
-        extras.notify("Shell Redirection unavailable: "..shellRedirection.error)
     end
     visualDiagnostics.aimMs = (os.clock() - now) * 1000
 end
@@ -3963,6 +4095,7 @@ _G.AutoLeadAssistDiagnostics = function()
         heldFire = { active = next(heldFire.inputs) ~= nil, busy = heldFire.busy == true },
         adaptiveAim = Settings.AdaptiveAim,
         shellRedirection = { enabled = Settings.ShellRedirection, radiusPixels = Settings.ShellFocusRadius,
+            held = shellRedirection.held, engaged = shellRedirection.isEngaged() == true,
             focusedPlayer = shellRedirection.focused and shellRedirection.focused.Name or nil,
             readyActors = shellRedirection.ready or 0, error = shellRedirection.error },
         infiniteAmmo = Settings.InfiniteAmmo,
@@ -4118,6 +4251,9 @@ heldFire.ended = UserInputService.InputEnded:Connect(function(input)
     if next(heldFire.inputs) == nil then heldFire.stop() end
 end)
 heldFire.focus = UserInputService.WindowFocusReleased:Connect(heldFire.stop)
+shellRedirection.began=UserInputService.InputBegan:Connect(shellRedirection.inputBegan)
+shellRedirection.ended=UserInputService.InputEnded:Connect(shellRedirection.inputEnded)
+shellRedirection.focusLost=UserInputService.WindowFocusReleased:Connect(shellRedirection.release)
 heldFire.tick = RunService.Heartbeat:Connect(function()
     firingShake.refreshSink()
     if next(heldFire.inputs) == nil then return end
@@ -4158,7 +4294,7 @@ _G.AutoLeadAssistUnload = function()
     for _, entry in ipairs(shotTracker.entries) do shotTracker.remove(entry) end
     releaseArtillerySlave()
     if uiInsertConn then uiInsertConn:Disconnect() end
-    shellRedirection.stop()
+    shellRedirection.destroy()
     if vibeUi then pcall(function() vibeUi:Unload() end) end
     if screenGui then screenGui:Destroy() end
     espStats.gui:Destroy()
