@@ -629,8 +629,11 @@ shellRedirection.active=false
 ]]
     code=code..[[
 local created={}
+local destroyedObjects={}
 local Instance={new=function(class)
-    local object={ClassName=class,Destroy=function(self)self.destroyed=true end}
+    local object={ClassName=class,Destroy=function(self)
+        self.destroyed=true;destroyedObjects[#destroyedObjects+1]=self
+    end}
     created[#created+1]=object
     return object
 end}
@@ -639,40 +642,85 @@ local THEME={TextPrimary=Color3.fromRGB(241,242,246)}
 shellRedirection.held=true;shellRedirection.heldKey=Settings.ShellFocusKey
 shellRedirection.focused=b.player;shellRedirection.focusedPart=b.part
 local pixel=Vector2.new(400,200)
+local drawProjections=projections
 shellRedirection.draw(camera,pixel)
 local visuals=shellRedirection.visuals
 check(visuals.gui.IgnoreGuiInset and visuals.circle.Position.X.Offset==400 and visuals.circle.Position.Y.Offset==200,
     "focus circle uses viewport coordinates")
 check(visuals.circle.Size.X.Offset==120 and visuals.circle.Size.Y.Offset==120 and visuals.stroke.Thickness==1,
     "circle exactly matches focus radius with thin stroke")
-check(visuals.highlight.Enabled and visuals.highlight.Adornee==b.character and visuals.highlight.FillColor==Settings.ShellFocusColor,
-    "only focused character receives distinct color")
+check(visuals.marker.Visible and visuals.markerStroke.Color==Settings.ShellFocusColor,
+    "only focused target receives the distinct screen-space marker color")
+check(visuals.marker.ClassName=="Frame" and visuals.marker.Size.X.Offset==12 and visuals.marker.Size.Y.Offset==12
+    and visuals.marker.Rotation==45 and visuals.marker.BackgroundTransparency==1,
+    "focus marker is a small hollow 12-pixel diamond")
+check(visuals.markerStroke.ClassName=="UIStroke" and visuals.markerStroke.Thickness==1,
+    "focus marker has a thin one-pixel stroke")
+check(visuals.marker.Parent==visuals.gui and visuals.markerStroke.Parent==visuals.marker,
+    "pooled focus marker belongs to the existing overlay")
+check(visuals.marker.Position.X.Offset==20 and visuals.marker.Position.Y.Offset==0,
+    "marker center matches the projected target")
+check(projections==drawProjections+1,"focus marker reuses the same single target projection as the tracer")
+local highlights=0
+for _,object in ipairs(created)do if object.ClassName=="Highlight" then highlights+=1 end end
+check(highlights==0 and not visuals.highlight and not visuals.marker.Adornee,
+    "enabled focus marking creates no native Highlight or character adornee binding")
 check(visuals.tracer.Visible and visuals.tracer.Size.Y.Offset==1,"one thin target tracer")
 local start=Vector2.new(640,716)
 local finish=Vector2.new(20,0)
 check(math.abs(visuals.tracer.Size.X.Offset-(finish-start).Magnitude)<0.001,"tracer endpoints follow projection")
 local count=#created
 local writes=shellRedirection.visualWrites
+local markerPosition=visuals.marker.Position
+local markerColor=visuals.markerStroke.Color
+drawProjections=projections
 for i=1,20 do shellRedirection.draw(camera,pixel) end
 check(#created==count,"visuals reused rather than rebuilt per frame")
-check(shellRedirection.visualWrites==writes,"stationary focus performs no repeated Highlight or GUI writes")
+check(shellRedirection.visualWrites==writes,"stationary focus performs no repeated GUI property writes")
+check(visuals.marker.Position==markerPosition and visuals.markerStroke.Color==markerColor,
+    "unmoved target retains its cached marker position and color")
+check(projections==drawProjections+20,"stable marker frames add no extra projection pass")
 Settings.ShellFocusTracer=false;Settings.ShellFocusHighlight=false
 shellRedirection.draw(camera,pixel)
-check(not visuals.tracer.Visible and not visuals.highlight.Enabled and not visuals.highlight.Adornee,
-    "disabled Highlight does not retain a target binding")
+check(not visuals.tracer.Visible and not visuals.marker.Visible,
+    "legacy highlight switch now independently hides the focus marker")
+Settings.ShellFocusHighlight=true
+shellRedirection.draw(camera,pixel)
+check(visuals.marker.Visible and not visuals.tracer.Visible and #created==count,
+    "re-enabling focus marker reuses its object without enabling the tracer")
+writes=shellRedirection.visualWrites
+b.part.Position=Vector3.new(23,4,100)
+shellRedirection.draw(camera,pixel)
+check(visuals.marker.Position.X.Offset==23 and visuals.marker.Position.Y.Offset==4
+    and shellRedirection.visualWrites==writes+1,"moving target updates only the marker position while tracer is off")
+local savedFocusColor=Settings.ShellFocusColor
+Settings.ShellFocusColor=Color3.fromRGB(80,180,255)
+shellRedirection.draw(camera,pixel)
+check(visuals.markerStroke.Color==Settings.ShellFocusColor,"focus color control updates the marker stroke")
+writes=shellRedirection.visualWrites
+markerPosition=visuals.marker.Position
+for i=1,20 do shellRedirection.draw(camera,pixel) end
+check(shellRedirection.visualWrites==writes and visuals.marker.Position==markerPosition,
+    "new marker position and color remain cached on subsequent stable frames")
+Settings.ShellFocusColor=savedFocusColor
+shellRedirection.focused=nil;shellRedirection.focusedPart=nil
+shellRedirection.draw(camera,pixel)
+check(not visuals.marker.Visible,"loss of a focused target hides the marker")
+shellRedirection.focused=b.player;shellRedirection.focusedPart=b.part
 Settings.ShellFocusTracer=true;Settings.ShellFocusHighlight=true
 b.part.Position=Vector3.new(20,0,-1)
 shellRedirection.draw(camera,pixel)
-check(not visuals.tracer.Visible and not visuals.highlight.Enabled,"behind-camera target hidden")
+check(not visuals.tracer.Visible and not visuals.marker.Visible,"behind-camera target hidden")
 b.part.Position=Vector3.new(20,0,100)
 shellRedirection.draw(camera,pixel);shellRedirection.release()
-check(not visuals.tracer.Visible and not visuals.highlight.Enabled and not visuals.highlight.Adornee,"release removes target cues")
+check(not visuals.tracer.Visible and not visuals.marker.Visible,"release removes target cues")
 shellRedirection.draw(camera,pixel)
-check(visuals.circle.Visible and not visuals.tracer.Visible,"idle circle remains without target tracer")
+check(visuals.circle.Visible and not visuals.tracer.Visible and not visuals.marker.Visible,
+    "idle circle remains without target tracer or marker")
 textbox={};shellRedirection.draw(camera,pixel)
 check(not visuals.gui.Enabled,"typing hides focus visuals")
 textbox=nil;Settings.ShellRedirection=false;shellRedirection.draw(camera,pixel)
-check(not visuals.gui.Enabled and not visuals.highlight.Enabled,"disabled mode hides overlay and highlight")
+check(not visuals.gui.Enabled and not visuals.marker.Visible,"disabled mode hides overlay and marker")
 ]]
     code=code..[[
 local simTime=1
@@ -698,7 +746,7 @@ end
 local scans=shellRedirection.focusScans-scansBefore
 check(scans>0 and scans<=20,"120 render frames perform at most 20 acquisition scans")
 check(shellRedirection.focusRays-raysBefore<=20,"stable visible focus raycasts are rate limited")
-check(shellRedirection.focused==b.player and visuals.tracer.Visible,"throttled focus retains live target cues")
+check(shellRedirection.focused==b.player and visuals.tracer.Visible and visuals.marker.Visible,"throttled focus retains live target cues")
 check(renderPublishes==0,"camera render callback performs no Actor publications")
 Settings.ShellVisibilityCheck=false;simTime+=0.051
 local beforeRay=rayCount
@@ -714,7 +762,7 @@ check(not shellRedirection.focused and not visuals.tracer.Visible,"leaving FOV c
 b.part.Position=Vector3.new(640,360,100);simTime+=0.051
 shellRedirection.frame(camera)
 b.humanoid.Health=0;shellRedirection.frame(camera)
-check(not shellRedirection.focused and not visuals.highlight.Enabled,"death clears immediately between acquisition scans")
+check(not shellRedirection.focused and not visuals.marker.Visible,"death clears immediately between acquisition scans")
 b.humanoid.Health=100;simTime+=0.051;shellRedirection.frame(camera)
 shellRedirection.release();shellRedirection.frame(camera)
 check(not shellRedirection.focused and not visuals.tracer.Visible,"RMB release remains immediate with scan throttling")
@@ -726,8 +774,10 @@ local connection={Disconnect=function()disconnected+=1 end}
 shellRedirection.began=connection;shellRedirection.ended=connection;shellRedirection.focusLost=connection;shellRedirection.tick=connection
 Settings.ShellRedirection=true
 shellRedirection.destroy()
-check(disconnected==4 and visuals.gui.destroyed and visuals.highlight.destroyed and not shellRedirection.visuals,
-    "unload removes owned input handlers and visual objects")
+check(disconnected==4 and visuals.gui.destroyed and not shellRedirection.visuals,
+    "unload removes owned input handlers and pooled overlay")
+check(#destroyedObjects==1 and destroyedObjects[1]==visuals.gui,
+    "focus unload destroys only the GUI hierarchy rather than separate native highlights")
 check(rosterDisconnected==2,"unload disconnects both event-maintained roster listeners")
 check(shellRedirection.destroyed and not shellRedirection.isEngaged() and Settings.ShellRedirection,
     "unload prevents reengagement without changing remembered toggle")

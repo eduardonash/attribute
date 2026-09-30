@@ -2,6 +2,16 @@
 
 ## 1. Overview
 
+### Lightweight focused-player marker (2026-09-29)
+
+The user isolated the remaining stutter to **Focused Player Highlight** under Shell Redirection. Read-only inspection using the Roblox MCP skill confirmed the opt-in-profiler build loaded, the focus Highlight toggle currently off, its native `AttributeFocusedPlayer` instance disabled but still present, six ready Actors and no tracked/active flight. This records the current state and the user's A/B result; no live focused/unfocused timing comparison was captured in this revision.
+
+That specific native character silhouette has been removed entirely. **Focused Player Marker** now shows a single pooled, hollow 12×12-pixel diamond with a one-pixel colored stroke at the focused part's screen position. It reuses the existing projection used by the tracer, with cached visibility, color and position writes: no extra target lookup, bounds scan, raycast, native Highlight creation or character Adornee changes. The marker is an intentionally small target cue, not a full-body silhouette. The existing `ShellFocusHighlight` preference/flag is retained for compatibility, so users who switched the old effect off can opt into the renamed marker. Focus color, circle, tracer, selection, steering, lock key, freecam navigation and tank Highlights are unchanged.
+
+Release, target loss/death, off-screen targets, typing and disabled redirection hide the marker. Unload destroys its single parent GUI hierarchy. A one-time reload migration removes only up to eight direct workspace Highlights with the exact legacy name `AttributeFocusedPlayer`, covering orphaned instances from a failed old unload without scanning the map or touching tank/game Highlights. Native profiler scopes remain off by default.
+
+Verification: full source compiled locally without execution; **329 assertions passed** (53 adaptive/native-fire, 191 redirection/acquisition/transport/visual, 7 freecam navigation, 78 profiling/window). New visual tests cover zero native focus Highlight creation even with the legacy toggle enabled, pooled marker geometry, existing projection reuse, cached stationary writes, a single position write on movement with tracer off, color/toggle behavior, target-loss/release cleanup and GUI-only destruction. The live frame-rate improvement remains to be verified after user reload; no revised full source was executed through MCP.
+
 ### Opt-in profiling and transport-only isolation (2026-09-29)
 
 The user reported that a063dff still stuttered, and felt worse. Two client probes timed out; after reconnecting into a new session, read-only Roblox MCP inspection confirmed Attribute was not loaded. A bounded unloaded-client baseline captured 240 released-input frames over 3.49 seconds: mean 14.54 ms, maximum 26.89 ms, zero intervals over 50 ms. This is a baseline under those conditions, not a focused-player comparison or proof of the responsible subsystem.

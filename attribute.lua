@@ -9,6 +9,13 @@
 if _G.AutoLeadAssistUnload then
     pcall(_G.AutoLeadAssistUnload)
 end
+-- Older unload failures can leave the native focus silhouette behind. Remove
+-- only that owned, direct child; never touch enemy-tank or game Highlights.
+for _ = 1, 8 do
+    local oldFocus = workspace:FindFirstChild("AttributeFocusedPlayer")
+    if not oldFocus or not oldFocus:IsA("Highlight") then break end
+    oldFocus:Destroy()
+end
 
 local TweenService = game:GetService("TweenService")
 local Players = game:GetService("Players")
@@ -693,7 +700,8 @@ do
             })
             settingToggle(aimTarget, "Focus FOV Circle", "ShellFocusCircle", "Thin circle showing the exact player focus radius.")
             settingToggle(aimTarget, "Focused Player Tracer", "ShellFocusTracer", "One thin tracer to the targeted player while holding the lock key.")
-            settingToggle(aimTarget, "Focused Player Highlight", "ShellFocusHighlight", "Highlight the targeted player while holding the lock key.")
+            settingToggle(aimTarget, "Focused Player Marker", "ShellFocusHighlight",
+                "Small colored focus diamond while holding the lock key. Uses a pooled screen marker, not a native character Highlight.")
             aimTarget:Label("Focused Player Color"):AddColorpicker({ Default = Settings.ShellFocusColor,
                 Flag = "ALA_ShellFocusColor", Callback = function(c) Settings.ShellFocusColor = c end })
             aimTarget:Dropdown({
@@ -1234,7 +1242,8 @@ local shellRedirection = { players = {}, records = {}, candidates = {}, focused 
     focusScans = 0, focusRays = 0, visualWrites = 0 }
 shellRedirection.performance = {
     nativeScopes={enabled=false,unsupported=false,calls=0,failures=0},
-    state={build="opt-in-profiler-isolation",transportPaused=false,activeActors=0,flightActive=false,publicationWrites=0},
+    state={build="focus-marker-no-native-highlight",focusVisualBackend="pooled-gui-diamond",
+        transportPaused=false,activeActors=0,flightActive=false,publicationWrites=0},
     acquisition={name="AutoLead_Acquisition",count=0,totalMs=0,lastMs=0,maxMs=0,over5Ms=0,over50Ms=0},
     frame={name="AutoLead_FocusFrame",count=0,totalMs=0,lastMs=0,maxMs=0,over5Ms=0,over50Ms=0},
     transport={name="AutoLead_Transport",count=0,totalMs=0,lastMs=0,maxMs=0,over5Ms=0,over50Ms=0},
@@ -1427,8 +1436,7 @@ function shellRedirection.release()
     end
     if shellRedirection.visuals then
         shellRedirection.visuals.tracer.Visible = false
-        shellRedirection.visuals.highlight.Enabled = false
-        shellRedirection.visuals.highlight.Adornee = nil
+        shellRedirection.visuals.marker.Visible = false
     end
 end
 function shellRedirection.inputBegan(input, processed)
@@ -1876,8 +1884,7 @@ function shellRedirection.draw(cam, pixel)
         if visuals then
             shellRedirection.assign(visuals.gui,"Enabled",false)
             shellRedirection.assign(visuals.tracer,"Visible",false)
-            shellRedirection.assign(visuals.highlight,"Enabled",false)
-            shellRedirection.assign(visuals.highlight,"Adornee",nil)
+            shellRedirection.assign(visuals.marker,"Visible",false)
         end
         return
     end
@@ -1902,11 +1909,15 @@ function shellRedirection.draw(cam, pixel)
         visuals.tracer.Name="FocusedPlayerTracer"; visuals.tracer.BorderSizePixel=0
         visuals.tracer.AnchorPoint=Vector2.new(0.5,0.5); visuals.tracer.BackgroundTransparency=0.18
         visuals.tracer.Visible=false; visuals.tracer.Parent=visuals.gui
-        visuals.highlight=Instance.new("Highlight")
-        visuals.highlight.Name="AttributeFocusedPlayer"; visuals.highlight.Enabled=false
-        visuals.highlight.FillTransparency=0.85; visuals.highlight.OutlineTransparency=0.15
-        visuals.highlight.DepthMode=Enum.HighlightDepthMode.AlwaysOnTop
-        visuals.highlight.Parent=workspace
+        visuals.marker=Instance.new("Frame")
+        visuals.marker.Name="FocusedPlayerMarker"; visuals.marker.BackgroundTransparency=1
+        visuals.marker.BorderSizePixel=0; visuals.marker.AnchorPoint=Vector2.new(0.5,0.5)
+        visuals.marker.Size=UDim2.fromOffset(12,12); visuals.marker.Rotation=45
+        visuals.marker.Visible=false; visuals.marker.Parent=visuals.gui
+        visuals.markerStroke=Instance.new("UIStroke")
+        visuals.markerStroke.Thickness=1; visuals.markerStroke.Transparency=0.1
+        visuals.markerStroke.ApplyStrokeMode=Enum.ApplyStrokeMode.Border
+        visuals.markerStroke.Parent=visuals.marker
     end
     shellRedirection.assign(visuals.gui,"Enabled",true)
     shellRedirection.assign(visuals.circle,"Visible",Settings.ShellFocusCircle)
@@ -1931,10 +1942,17 @@ function shellRedirection.draw(cam, pixel)
     local color=Settings.ShellFocusColor
     shellRedirection.assign(visuals.stroke,"Color",tracked and color or THEME.TextPrimary)
     shellRedirection.assign(visuals.stroke,"Transparency",engaged and 0.2 or 0.6)
-    shellRedirection.assign(visuals.highlight,"Adornee",tracked and Settings.ShellFocusHighlight and focused.Character or nil)
-    shellRedirection.assign(visuals.highlight,"FillColor",color)
-    shellRedirection.assign(visuals.highlight,"OutlineColor",color)
-    shellRedirection.assign(visuals.highlight,"Enabled",tracked and Settings.ShellFocusHighlight)
+    shellRedirection.assign(visuals.marker,"Visible",tracked and Settings.ShellFocusHighlight)
+    if visuals.marker.Visible then
+        shellRedirection.assign(visuals.markerStroke,"Color",color)
+        -- Reuse the projection already needed by the tracer. No character
+        -- bounds scan, extra raycast, Adornee change or 3D Highlight pass.
+        if visuals.markerX~=point.X or visuals.markerY~=point.Y then
+            visuals.markerX,visuals.markerY=point.X,point.Y
+            visuals.marker.Position=UDim2.fromOffset(point.X,point.Y)
+            shellRedirection.visualWrites+=1
+        end
+    end
     shellRedirection.assign(visuals.tracer,"Visible",tracked and Settings.ShellFocusTracer)
     shellRedirection.assign(visuals.tracer,"BackgroundColor3",color)
     if visuals.tracer.Visible then
@@ -1996,7 +2014,7 @@ function shellRedirection.destroy()
         if connection then connection:Disconnect() end
     end
     local visuals=shellRedirection.visuals
-    if visuals then visuals.highlight:Destroy(); visuals.gui:Destroy(); shellRedirection.visuals=nil end
+    if visuals then visuals.gui:Destroy(); shellRedirection.visuals=nil end
 end
 
 -- Prefer vehicles/characters even behind scenery, then use the visible map
