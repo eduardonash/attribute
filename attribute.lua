@@ -1177,7 +1177,8 @@ end
 -- The target classes change much less often than the cursor. Cache only the
 -- raycast filters; the ray origin/direction and actual hit are still read every
 -- rendered frame so the preview does not lag behind mouse movement.
-local shellRedirection = { players = {}, candidates = {}, focused = nil, held = false }
+local shellRedirection = { players = {}, candidates = {}, focused = nil, held = false,
+    focusScans = 0, focusRays = 0, visualWrites = 0 }
 local aimIncludeParams = RaycastParams.new()
 aimIncludeParams.FilterType = Enum.RaycastFilterType.Include
 aimIncludeParams.IgnoreWater = true
@@ -1235,6 +1236,7 @@ function shellRedirection.isEngaged()
 end
 function shellRedirection.release()
     shellRedirection.held, shellRedirection.focused, shellRedirection.focusedPart = false,nil,nil
+    shellRedirection.focusedRecord, shellRedirection.nextFocusScan = nil,nil
     if shellRedirection.active and lp:GetAttribute("AttributeShellRedirectOwner")==shellRedirection.owner then
         lp:SetAttribute("AttributeShellRedirectHeld",false)
         lp:SetAttribute("AttributeShellRedirectPosition",nil)
@@ -1256,7 +1258,9 @@ end
 function shellRedirection.select(cam, pixel, origin)
     shellRedirection.focused = nil
     shellRedirection.focusedPart = nil
+    shellRedirection.focusedRecord = nil
     if not shellRedirection.isEngaged() then return end
+    shellRedirection.focusScans=(shellRedirection.focusScans or 0)+1
     local candidates = shellRedirection.candidates
     table.clear(candidates)
     local radiusSquared = Settings.ShellFocusRadius * Settings.ShellFocusRadius
@@ -1271,20 +1275,22 @@ function shellRedirection.select(cam, pixel, origin)
             if visible and point.Z > 0 and distance <= radiusSquared then
                 -- Keep only the four nearest candidates, bounding visibility rays.
                 local index = 1
-                while candidates[index] and candidates[index].distance <= distance do index += 1 end
+                while candidates[index] and candidates[index].focusDistance <= distance do index += 1 end
                 if index <= 4 then
-                    table.insert(candidates,index,{record=record,distance=distance})
+                    record.focusDistance=distance
+                    table.insert(candidates,index,record)
                     if #candidates > 4 then table.remove(candidates) end
                 end
             end
         end
     end
-    for _, candidate in ipairs(candidates) do
-        local record = candidate.record
+    for _, record in ipairs(candidates) do
+        shellRedirection.focusRays=(shellRedirection.focusRays or 0)+1
         local hit = workspace:Raycast(origin,record.part.Position-origin,aimWorldParams)
         if not hit or hit.Instance:IsDescendantOf(record.character) then
             shellRedirection.focused = record.player
             shellRedirection.focusedPart = record.part
+            shellRedirection.focusedRecord = record
             return record.part.Position, record.part.AssemblyLinearVelocity, record.part, Vector3.yAxis
         end
     end
@@ -1329,17 +1335,30 @@ end
 if not original then return end
 @STEER@
 local oldStatus = actor:GetAttribute("AttributeShellRedirectStatus")
+local cachedHeartbeat,cachedPosition,cachedVelocity
+local refreshedAt = -math.huge
 local wrapper
 wrapper = function(state, ...)
-    local heartbeat = player:GetAttribute("AttributeShellRedirectHeartbeat")
-    if player:GetAttribute("AttributeShellRedirectOwner")==owner
+    -- Most callbacks are other players' shells, impacts or unsupported behaviors.
+    -- Skip all cross-Actor attribute reads for those states.
+    if type(state)=="table" and state.replicate==true and state.Behavior=="Default"
+        and not state.destroy and not state.hitray and not state.physicalprojectile
+        and player:GetAttribute("AttributeShellRedirectOwner")==owner
         and player:GetAttribute("AttributeShellRedirectHeld")==true
-        and type(heartbeat)=="number" and os.clock()-heartbeat < 0.75 then
-        local position = player:GetAttribute("AttributeShellRedirectPosition")
-        local velocity = player:GetAttribute("AttributeShellRedirectVelocity")
-        local ok, err = pcall(steer,state,position,velocity)
-        if not ok then
-            actor:SetAttribute("AttributeShellRedirectStatus", owner.."|error: "..tostring(err))
+    then
+        local now=os.clock()
+        if now-refreshedAt>=0.05 then
+            cachedHeartbeat=player:GetAttribute("AttributeShellRedirectHeartbeat")
+            cachedPosition=player:GetAttribute("AttributeShellRedirectPosition")
+            cachedVelocity=player:GetAttribute("AttributeShellRedirectVelocity")
+            refreshedAt=now
+        end
+        if type(cachedHeartbeat)=="number" and now-cachedHeartbeat<0.75
+            and cachedPosition and cachedVelocity then
+            local ok, err = pcall(steer,state,cachedPosition,cachedVelocity)
+            if not ok then
+                actor:SetAttribute("AttributeShellRedirectStatus", owner.."|error: "..tostring(err))
+            end
         end
     end
     return original(state, ...)
@@ -1419,27 +1438,31 @@ function shellRedirection.update()
     local engaged = shellRedirection.isEngaged() == true
     if lp:GetAttribute("AttributeShellRedirectHeld")~=engaged then lp:SetAttribute("AttributeShellRedirectHeld",engaged) end
     if not engaged then
-        lp:SetAttribute("AttributeShellRedirectPosition",nil)
-        lp:SetAttribute("AttributeShellRedirectVelocity",nil)
+        if lp:GetAttribute("AttributeShellRedirectPosition")~=nil then lp:SetAttribute("AttributeShellRedirectPosition",nil) end
+        if lp:GetAttribute("AttributeShellRedirectVelocity")~=nil then lp:SetAttribute("AttributeShellRedirectVelocity",nil) end
     end
     if now-(shellRedirection.updated or 0)<0.05 then return end
     shellRedirection.updated = now
     local focused = shellRedirection.focused
-    local character = focused and focused.Character
-    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-    local part = character and (character:FindFirstChild("UpperTorso") or character:FindFirstChild("Torso")
-        or character:FindFirstChild("HumanoidRootPart"))
-    local valid = engaged and focused and focused.Parent==Players and humanoid and humanoid.Health>0 and part
-    lp:SetAttribute("AttributeShellRedirectPosition",valid and part.Position or nil)
-    lp:SetAttribute("AttributeShellRedirectVelocity",valid and part.AssemblyLinearVelocity or nil)
+    local record=shellRedirection.focusedRecord
+    local part=record and record.part
+    local valid = engaged and record and focused==record.player and focused.Parent==Players
+        and focused.Character==record.character and record.humanoid.Health>0 and part.Parent
+    local position=valid and part.Position or nil
+    local velocity=valid and part.AssemblyLinearVelocity or nil
+    if lp:GetAttribute("AttributeShellRedirectPosition")~=position then lp:SetAttribute("AttributeShellRedirectPosition",position) end
+    if lp:GetAttribute("AttributeShellRedirectVelocity")~=velocity then lp:SetAttribute("AttributeShellRedirectVelocity",velocity) end
     lp:SetAttribute("AttributeShellRedirectHeartbeat",now)
-    shellRedirection.ready = 0
-    for _,actor in ipairs(shellRedirection.actors) do
-        local status = actor:GetAttribute("AttributeShellRedirectStatus")
-        if status==shellRedirection.owner then
-            shellRedirection.ready+=1
-        elseif type(status)=="string" and status:sub(1,#shellRedirection.owner)==shellRedirection.owner then
-            shellRedirection.error = status
+    if now-(shellRedirection.statusAt or -1)>=0.5 then
+        shellRedirection.statusAt=now
+        shellRedirection.ready = 0
+        for _,actor in ipairs(shellRedirection.actors) do
+            local status = actor:GetAttribute("AttributeShellRedirectStatus")
+            if status==shellRedirection.owner then
+                shellRedirection.ready+=1
+            elseif type(status)=="string" and status:sub(1,#shellRedirection.owner)==shellRedirection.owner then
+                shellRedirection.error = status
+            end
         end
     end
     if shellRedirection.error or shellRedirection.ready==0 and now-shellRedirection.installAt>2 then
@@ -1449,13 +1472,21 @@ function shellRedirection.update()
     end
 end
 
+function shellRedirection.assign(object, property, value)
+    if object[property]~=value then
+        object[property]=value
+        shellRedirection.visualWrites=(shellRedirection.visualWrites or 0)+1
+    end
+end
 function shellRedirection.draw(cam, pixel)
     local show = Settings.ShellRedirection and not shellRedirection.failed and UserInputService:GetFocusedTextBox()==nil
     local visuals = shellRedirection.visuals
     if not show then
         if visuals then
-            visuals.gui.Enabled=false; visuals.tracer.Visible=false
-            visuals.highlight.Enabled=false; visuals.highlight.Adornee=nil
+            shellRedirection.assign(visuals.gui,"Enabled",false)
+            shellRedirection.assign(visuals.tracer,"Visible",false)
+            shellRedirection.assign(visuals.highlight,"Enabled",false)
+            shellRedirection.assign(visuals.highlight,"Adornee",nil)
         end
         return
     end
@@ -1486,10 +1517,18 @@ function shellRedirection.draw(cam, pixel)
         visuals.highlight.DepthMode=Enum.HighlightDepthMode.AlwaysOnTop
         visuals.highlight.Parent=workspace
     end
-    visuals.gui.Enabled=true
-    visuals.circle.Visible=Settings.ShellFocusCircle
-    visuals.circle.Position=UDim2.fromOffset(pixel.X,pixel.Y)
-    visuals.circle.Size=UDim2.fromOffset(Settings.ShellFocusRadius*2,Settings.ShellFocusRadius*2)
+    shellRedirection.assign(visuals.gui,"Enabled",true)
+    shellRedirection.assign(visuals.circle,"Visible",Settings.ShellFocusCircle)
+    if visuals.pixel~=pixel then
+        visuals.pixel=pixel
+        visuals.circle.Position=UDim2.fromOffset(pixel.X,pixel.Y)
+        shellRedirection.visualWrites+=1
+    end
+    if visuals.radius~=Settings.ShellFocusRadius then
+        visuals.radius=Settings.ShellFocusRadius
+        visuals.circle.Size=UDim2.fromOffset(visuals.radius*2,visuals.radius*2)
+        shellRedirection.visualWrites+=1
+    end
     local engaged = shellRedirection.isEngaged()
     local focused = engaged and shellRedirection.focused
     local part = focused and shellRedirection.focusedPart
@@ -1499,20 +1538,25 @@ function shellRedirection.draw(cam, pixel)
     end
     local tracked = visible == true and point.Z>0
     local color=Settings.ShellFocusColor
-    visuals.stroke.Color=tracked and color or THEME.TextPrimary
-    visuals.stroke.Transparency=engaged and 0.2 or 0.6
-    visuals.highlight.Enabled=tracked and Settings.ShellFocusHighlight
-    visuals.highlight.Adornee=tracked and focused.Character or nil
-    visuals.highlight.FillColor=color; visuals.highlight.OutlineColor=color
-    visuals.tracer.Visible=tracked and Settings.ShellFocusTracer
-    visuals.tracer.BackgroundColor3=color
+    shellRedirection.assign(visuals.stroke,"Color",tracked and color or THEME.TextPrimary)
+    shellRedirection.assign(visuals.stroke,"Transparency",engaged and 0.2 or 0.6)
+    shellRedirection.assign(visuals.highlight,"Adornee",tracked and focused.Character or nil)
+    shellRedirection.assign(visuals.highlight,"FillColor",color)
+    shellRedirection.assign(visuals.highlight,"OutlineColor",color)
+    shellRedirection.assign(visuals.highlight,"Enabled",tracked and Settings.ShellFocusHighlight)
+    shellRedirection.assign(visuals.tracer,"Visible",tracked and Settings.ShellFocusTracer)
+    shellRedirection.assign(visuals.tracer,"BackgroundColor3",color)
     if visuals.tracer.Visible then
         local start=Vector2.new(cam.ViewportSize.X*0.5,cam.ViewportSize.Y-4)
         local finish=Vector2.new(point.X,point.Y)
-        local delta=finish-start
-        visuals.tracer.Position=UDim2.fromOffset((start.X+finish.X)*0.5,(start.Y+finish.Y)*0.5)
-        visuals.tracer.Size=UDim2.fromOffset(delta.Magnitude,1)
-        visuals.tracer.Rotation=math.deg(math.atan2(delta.Y,delta.X))
+        if visuals.lineStart~=start or visuals.lineEnd~=finish then
+            visuals.lineStart,visuals.lineEnd=start,finish
+            local delta=finish-start
+            visuals.tracer.Position=UDim2.fromOffset((start.X+finish.X)*0.5,(start.Y+finish.Y)*0.5)
+            visuals.tracer.Size=UDim2.fromOffset(delta.Magnitude,1)
+            visuals.tracer.Rotation=math.deg(math.atan2(delta.Y,delta.X))
+            shellRedirection.visualWrites+=3
+        end
     end
 end
 function shellRedirection.frame(cam)
@@ -1521,12 +1565,30 @@ function shellRedirection.frame(cam)
         and not shellRedirection.failed then return end
     local source = Settings.Freecam and freecamActive and "Mouse" or Settings.AimSource
     local pixel = source=="Mouse" and UserInputService:GetMouseLocation() or cam.ViewportSize*0.5
-    if Settings.ShellRedirection and not shellRedirection.failed then
+    local now=os.clock()
+    if shellRedirection.isEngaged() then
         refreshAimFilters(getActiveTank())
-        local ray=cam:ViewportPointToRay(pixel.X,pixel.Y)
-        shellRedirection.select(cam,pixel,ray.Origin)
+        -- Membership/visibility acquisition is capped; current bounds are still
+        -- checked each rendered frame so leaving the circle clears immediately.
+        if not shellRedirection.nextFocusScan or now>=shellRedirection.nextFocusScan then
+            shellRedirection.nextFocusScan=now+0.05
+            local ray=cam:ViewportPointToRay(pixel.X,pixel.Y)
+            shellRedirection.select(cam,pixel,ray.Origin)
+        else
+            local record=shellRedirection.focusedRecord
+            local valid=record and record.player.Parent==Players and record.player.Character==record.character
+                and record.part.Parent and record.humanoid.Health>0 and not record.player.Neutral
+                and record.player.Team~=nil and record.player.Team~=lp.Team
+            local point,visible
+            if valid then point,visible=cam:WorldToViewportPoint(record.part.Position) end
+            if not valid or not visible or point.Z<=0
+                or (point.X-pixel.X)^2+(point.Y-pixel.Y)^2>Settings.ShellFocusRadius^2 then
+                shellRedirection.focused,shellRedirection.focusedPart,shellRedirection.focusedRecord=nil,nil,nil
+            end
+        end
     else
-        shellRedirection.focused, shellRedirection.focusedPart=nil,nil
+        shellRedirection.focused,shellRedirection.focusedPart,shellRedirection.focusedRecord=nil,nil,nil
+        shellRedirection.nextFocusScan=nil
     end
     shellRedirection.update()
     shellRedirection.draw(cam,pixel)
@@ -4097,7 +4159,9 @@ _G.AutoLeadAssistDiagnostics = function()
         shellRedirection = { enabled = Settings.ShellRedirection, radiusPixels = Settings.ShellFocusRadius,
             held = shellRedirection.held, engaged = shellRedirection.isEngaged() == true,
             focusedPlayer = shellRedirection.focused and shellRedirection.focused.Name or nil,
-            readyActors = shellRedirection.ready or 0, error = shellRedirection.error },
+            readyActors = shellRedirection.ready or 0, error = shellRedirection.error,
+            focusScans = shellRedirection.focusScans, focusRays = shellRedirection.focusRays,
+            visualWrites = shellRedirection.visualWrites },
         infiniteAmmo = Settings.InfiniteAmmo,
         vehicleExtras = { localEdits = #extras.edits, error = extras.tuningError,
             turretSpeedEnabled = Settings.TurretSpeedEnabled, rapidFireEnabled = Settings.TankRapidFire },

@@ -2,6 +2,14 @@
 
 ## 1. Overview
 
+### Focus lock-on performance revision (2026-09-29)
+
+RMB focus acquisition now runs at most 20 times per second instead of on every rendered frame. It reuses cached player records rather than allocating candidate wrappers. The current target's life, team, respawn reference, viewport position and circle bounds are still checked each frame, so release, death and leaving the circle hide its cues immediately. Visibility raycasts remain bounded to four per scan; a newly occluded target can persist until the next scan (up to 50 ms).
+
+Circle/tracer geometry continues following the camera each frame, but unchanged GUI and Highlight properties are no longer rewritten. A stationary target/camera/cursor needs no repeated visual property writes after the initial update. Actor callbacks skip attribute reads entirely for other players' shells and unsupported states. Eligible own shells cache target pose/heartbeat at 20 Hz while checking ownership and the RMB hold gate on every callback. Actor installation/status polling is reduced to 2 Hz. No new render loop was added. Diagnostics now expose cumulative `focusScans`, `focusRays` and `visualWrites` counters.
+
+Verification: the full script compiled locally without execution. Forty adaptive aiming and fifty-six redirection/input/render/performance assertions passed (96 total). Regression checks cover at most 20 acquisition scans across 120 simulated render frames, rate-limited visibility rays, zero repeated stationary visual writes, zero attribute reads for 100 other-player shell callbacks, cached own-shell reads and immediate release/death/FOV cleanup. These are local call-count tests, not measured Roblox FPS; live stutter reduction and native Highlight rendering cost remain unverified.
+
 ### RMB focus controls and target cues (2026-09-29)
 
 Enable **Aim → Targeting → Shell Redirection**, then **hold RMB** to focus and steer. Releasing RMB clears the published target and Actor hold gate immediately; it does not wait for the 20 Hz position refresh. UI-consumed presses and typing do not engage the feature. Window focus loss cancels the hold, requiring another press. RMB retains its existing freecam camera-look behavior; in freecam, focus follows the mouse pixel used by that camera. Actor adapters remain installed while the feature switch is enabled, avoiding repeated hook installation on each press.

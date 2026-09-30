@@ -15,7 +15,8 @@ local Settings={ShellRedirection=true,ShellFocusRadius=60,ShellFocusCircle=true,
 local shellRedirection={players={},candidates={},held=true}
 local Players={}
 local attrs={AttributeShellRedirectOwner="fixture",AttributeShellRedirectHeartbeat=os.clock(),AttributeShellRedirectHeld=true}
-local lp={Team="blue",Parent=true,PlayerGui={},GetAttribute=function(_,k) return attrs[k] end,
+local attributeReads=0
+local lp={Team="blue",Parent=true,PlayerGui={},GetAttribute=function(_,k) attributeReads+=1;return attrs[k] end,
     SetAttribute=function(_,k,v)attrs[k]=v end}
 local textbox=nil
 local UserInputService={GetFocusedTextBox=function()return textbox end}
@@ -117,6 +118,12 @@ s=state()
 local results=table.pack(environment.simulatebullet(s))
 check(s.velocity.Y>99 and calls==1,"wrapper steers before native simulation display")
 check(results.n==3 and results[1]=="native" and results[3]==42,"native return values preserved")
+local readsBefore=attributeReads
+for i=1,100 do local foreign=state();foreign.replicate=false;environment.simulatebullet(foreign) end
+check(attributeReads==readsBefore,"other players' shells require no Actor attribute reads")
+readsBefore=attributeReads
+for i=1,10 do environment.simulatebullet(state()) end
+check(attributeReads-readsBefore<=23,"own shells reuse position velocity and heartbeat within refresh interval")
 attrs.AttributeShellRedirectHeld=false
 s=state();environment.simulatebullet(s)
 check(s.velocity==Vector3.xAxis*100,"Actor hold gate immediately prevents steering")
@@ -142,7 +149,7 @@ local Instance={new=function(class)
     return object
 end}
 local THEME={TextPrimary=Color3.fromRGB(241,242,246)}
-]]..section('function shellRedirection.draw(', 'function shellRedirection.frame(')..[[
+]]..section('function shellRedirection.assign(', 'function shellRedirection.frame(')..[[
 shellRedirection.held=true;shellRedirection.focused=b.player;shellRedirection.focusedPart=b.part
 local pixel=Vector2.new(400,200)
 shellRedirection.draw(camera,pixel)
@@ -158,8 +165,10 @@ local start=Vector2.new(640,716)
 local finish=Vector2.new(20,0)
 check(math.abs(visuals.tracer.Size.X.Offset-(finish-start).Magnitude)<0.001,"tracer endpoints follow projection")
 local count=#created
+local writes=shellRedirection.visualWrites
 for i=1,20 do shellRedirection.draw(camera,pixel) end
 check(#created==count,"visuals reused rather than rebuilt per frame")
+check(shellRedirection.visualWrites==writes,"stationary focus performs no repeated Highlight or GUI writes")
 Settings.ShellFocusTracer=false;Settings.ShellFocusHighlight=false
 shellRedirection.draw(camera,pixel)
 check(not visuals.tracer.Visible and not visuals.highlight.Enabled,"visual toggles independent")
@@ -176,6 +185,40 @@ textbox={};shellRedirection.draw(camera,pixel)
 check(not visuals.gui.Enabled,"typing hides focus visuals")
 textbox=nil;Settings.ShellRedirection=false;shellRedirection.draw(camera,pixel)
 check(not visuals.gui.Enabled and not visuals.highlight.Enabled,"disabled mode hides overlay and highlight")
+]]
+    code=code..[[
+local simTime=1
+local os={clock=function()return simTime end}
+local function refreshAimFilters()end
+local function getActiveTank()return nil end
+local freecamActive=false
+camera.ViewportPointToRay=function()return {Origin=Vector3.zero}end
+shellRedirection.update=function()end
+]]..section('function shellRedirection.frame(', 'function shellRedirection.destroy(')..[[
+Settings.ShellRedirection=true;Settings.AimSource="Camera"
+shellRedirection.held=true;shellRedirection.nextFocusScan=nil
+shellRedirection.players={b};blocked={}
+b.part.Position=Vector3.new(640,360,100)
+local scansBefore=shellRedirection.focusScans
+local raysBefore=shellRedirection.focusRays
+for i=1,120 do
+    simTime=1+(i-1)/120
+    shellRedirection.frame(camera)
+end
+local scans=shellRedirection.focusScans-scansBefore
+check(scans>0 and scans<=20,"120 render frames perform at most 20 acquisition scans")
+check(shellRedirection.focusRays-raysBefore<=20,"stable visible focus raycasts are rate limited")
+check(shellRedirection.focused==b.player and visuals.tracer.Visible,"throttled focus retains live target cues")
+b.part.Position=Vector3.new(2000,360,100)
+shellRedirection.frame(camera)
+check(not shellRedirection.focused and not visuals.tracer.Visible,"leaving FOV clears between acquisition scans")
+b.part.Position=Vector3.new(640,360,100);simTime+=0.051
+shellRedirection.frame(camera)
+b.humanoid.Health=0;shellRedirection.frame(camera)
+check(not shellRedirection.focused and not visuals.highlight.Enabled,"death clears immediately between acquisition scans")
+b.humanoid.Health=100;simTime+=0.051;shellRedirection.frame(camera)
+shellRedirection.release();shellRedirection.frame(camera)
+check(not shellRedirection.focused and not visuals.tracer.Visible,"RMB release remains immediate with scan throttling")
 ]]
     code=code..section('function shellRedirection.stop(', 'function shellRedirection.update(')
         ..section('function shellRedirection.destroy(', '-- Prefer vehicles/characters')..[[
