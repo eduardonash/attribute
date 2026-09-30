@@ -83,6 +83,17 @@ local function stylePanel(panel)
 end
 
 local rememberedSettings = _G.AutoLeadAssistRemembered or {}
+local function normalizeFocusKey(value)
+    local text = tostring(value)
+    local name = text:match("Enum%.KeyCode%.([%w_]+)$")
+    if name and name ~= "Unknown" and name ~= "Backspace" then
+        local ok,key=pcall(function() return Enum.KeyCode[name] end)
+        if ok then return key end
+    end
+    name = text:match("Enum%.UserInputType%.(MouseButton[123])$")
+    if name then return Enum.UserInputType[name] end
+    return nil
+end
 local adaptiveAim = rememberedSettings.AdaptiveAim
 if adaptiveAim == nil then
     adaptiveAim = rememberedSettings.AutoLead ~= false or rememberedSettings.AutoBallistic == true
@@ -99,6 +110,8 @@ local Settings = {
     Trajectory = true,
     AdaptiveAim = adaptiveAim == true,
     ShellRedirection = rememberedSettings.ShellRedirection == true,
+    ShellFocusKey = normalizeFocusKey(rememberedSettings.ShellFocusKey) or Enum.UserInputType.MouseButton2,
+    ShellVisibilityCheck = rememberedSettings.ShellVisibilityCheck == true,
     ShellFocusRadius = math.clamp(tonumber(rememberedSettings.ShellFocusRadius) or 60, 5, 250),
     ShellFocusCircle = rememberedSettings.ShellFocusCircle ~= false,
     ShellFocusTracer = rememberedSettings.ShellFocusTracer ~= false,
@@ -151,6 +164,9 @@ local Settings = {
     ZoomKey = rememberedSettings.ZoomKey or Enum.KeyCode.Z
 }
 _G.AutoLeadAssistRemembered = Settings
+local function isAdaptiveAimActive()
+    return Settings.EnableAutoLead and Settings.AdaptiveAim and not Settings.ShellRedirection
+end
 
 -- Suppress only the visual muzzle-recoil presets. Explosion effects, physical
 -- recoil, firing logic and camera navigation remain owned by the game.
@@ -647,15 +663,32 @@ do
                 "Align both axes only for a selected high-arc fallback. Direct shots keep normal tracking; some native modes require the gunner optic active.")
             local aimTarget = aimTab:Section({ Name = "Targeting", Side = 2 })
             settingToggle(aimTarget, "Shell Redirection", "ShellRedirection",
-                "Hold RMB to steer airborne ordinary shells toward the focused enemy. Release RMB to stop steering. Requires projectile Actor access.")
+                "Fire normally, then hold your lock key to steer an airborne shell. Temporarily pauses adaptive aim, auto-elevation and pre-shot previews.")
+            local lockKeyHandle
+            lockKeyHandle = aimTarget:Label("Lock-on Key (Hold)"):AddKeybind({
+                Flag = "ALA_ShellFocusKey", Default = Settings.ShellFocusKey, Mode = "Hold",
+                -- Raw input below handles hold/release and UI consumption; the
+                -- library only owns rebinding, not a second activation handler.
+                Callback = function() end,
+                OnChanged = function(key, mode)
+                    Settings.ShellFocusKey = normalizeFocusKey(key)
+                    if lockKeyHandle and mode ~= "Hold" then lockKeyHandle:SetMode("Hold") end
+                end
+            })
+            aimTarget:Button():Add("Reset Lock Key to RMB", function()
+                Settings.ShellFocusKey = Enum.UserInputType.MouseButton2
+                lockKeyHandle:Set({Key=Settings.ShellFocusKey,Mode="Hold"})
+            end)
+            settingToggle(aimTarget, "Target Visibility Check", "ShellVisibilityCheck",
+                "Optional map sightline check; off by default to avoid targeting raycasts. Shell collisions are unchanged.")
             aimTarget:Slider({
                 Name = "Player Focus Radius", Flag = "ALA_ShellFocusRadius",
                 Min = 5, Max = 250, Default = Settings.ShellFocusRadius, Decimals = 1, Suffix = " px",
                 Callback = function(value) Settings.ShellFocusRadius = math.clamp(value, 5, 250) end
             })
             settingToggle(aimTarget, "Focus FOV Circle", "ShellFocusCircle", "Thin circle showing the exact player focus radius.")
-            settingToggle(aimTarget, "Focused Player Tracer", "ShellFocusTracer", "One thin tracer from the screen bottom to the targeted player while holding RMB.")
-            settingToggle(aimTarget, "Focused Player Highlight", "ShellFocusHighlight", "Highlight only the targeted player in a distinct color while holding RMB.")
+            settingToggle(aimTarget, "Focused Player Tracer", "ShellFocusTracer", "One thin tracer to the targeted player while holding the lock key.")
+            settingToggle(aimTarget, "Focused Player Highlight", "ShellFocusHighlight", "Highlight the targeted player while holding the lock key.")
             aimTarget:Label("Focused Player Color"):AddColorpicker({ Default = Settings.ShellFocusColor,
                 Flag = "ALA_ShellFocusColor", Callback = function(c) Settings.ShellFocusColor = c end })
             aimTarget:Dropdown({
@@ -1177,7 +1210,7 @@ end
 -- The target classes change much less often than the cursor. Cache only the
 -- raycast filters; the ray origin/direction and actual hit are still read every
 -- rendered frame so the preview does not lag behind mouse movement.
-local shellRedirection = { players = {}, candidates = {}, focused = nil, held = false,
+local shellRedirection = { players = {}, records = {}, candidates = {}, focused = nil, held = false,
     focusScans = 0, focusRays = 0, visualWrites = 0 }
 local aimIncludeParams = RaycastParams.new()
 aimIncludeParams.FilterType = Enum.RaycastFilterType.Include
@@ -1205,18 +1238,8 @@ local function refreshAimFilters(veh)
             if candidate ~= veh then targets[#targets + 1] = candidate end
         end
     end
-    table.clear(shellRedirection.players)
     for _, player in ipairs(Players:GetPlayers()) do
         if player ~= lp and player.Character then targets[#targets + 1] = player.Character end
-        local character = player ~= lp and player.Character
-        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-        local part = character and (character:FindFirstChild("UpperTorso")
-            or character:FindFirstChild("Torso") or character:FindFirstChild("HumanoidRootPart"))
-        if humanoid and part and part:IsA("BasePart") then
-            shellRedirection.players[#shellRedirection.players + 1] = {
-                player = player, character = character, humanoid = humanoid, part = part
-            }
-        end
     end
     local spawnedPlayers = workspace:FindFirstChild("SpawnedPlayers")
     if spawnedPlayers then
@@ -1229,13 +1252,38 @@ local function refreshAimFilters(veh)
     aimWorldParams.FilterDescendantsInstances = { veh, lp.Character }
 end
 
+function shellRedirection.refreshPlayers(now)
+    if now < (shellRedirection.nextRoster or 0) then return end
+    shellRedirection.nextRoster = now + 0.5
+    table.clear(shellRedirection.players)
+    for _, player in ipairs(Players:GetPlayers()) do
+        local character = player ~= lp and player.Character
+        local record = shellRedirection.records[player]
+        if character and (not record or record.character ~= character or not record.part.Parent
+            or not record.humanoid.Parent) then
+            local humanoid = character:FindFirstChildOfClass("Humanoid")
+            local part = character:FindFirstChild("UpperTorso") or character:FindFirstChild("Torso")
+                or character:FindFirstChild("HumanoidRootPart")
+            record = humanoid and part and part:IsA("BasePart") and {
+                player=player,character=character,humanoid=humanoid,part=part
+            } or nil
+            shellRedirection.records[player] = record
+        end
+        if character and record then shellRedirection.players[#shellRedirection.players+1] = record end
+    end
+    for player in pairs(shellRedirection.records) do
+        if player.Parent ~= Players or not player.Character then shellRedirection.records[player] = nil end
+    end
+end
 function shellRedirection.isEngaged()
     return Settings.ShellRedirection and shellRedirection.held and not shellRedirection.failed
         and not shellRedirection.destroyed
+        and shellRedirection.heldKey == Settings.ShellFocusKey
         and UserInputService:GetFocusedTextBox() == nil
 end
 function shellRedirection.release()
     shellRedirection.held, shellRedirection.focused, shellRedirection.focusedPart = false,nil,nil
+    shellRedirection.heldKey = nil
     shellRedirection.focusedRecord, shellRedirection.nextFocusScan = nil,nil
     if shellRedirection.active and lp:GetAttribute("AttributeShellRedirectOwner")==shellRedirection.owner then
         lp:SetAttribute("AttributeShellRedirectHeld",false)
@@ -1249,11 +1297,16 @@ function shellRedirection.release()
     end
 end
 function shellRedirection.inputBegan(input, processed)
-    if not processed and input.UserInputType==Enum.UserInputType.MouseButton2
-        and UserInputService:GetFocusedTextBox()==nil then shellRedirection.held=true end
+    local key = Settings.ShellFocusKey
+    if Settings.ShellRedirection and key and not processed
+        and (input.KeyCode==key or input.UserInputType==key)
+        and UserInputService:GetFocusedTextBox()==nil then
+        shellRedirection.held, shellRedirection.heldKey = true,key
+    end
 end
 function shellRedirection.inputEnded(input)
-    if input.UserInputType==Enum.UserInputType.MouseButton2 then shellRedirection.release() end
+    if shellRedirection.heldKey and (input.KeyCode==shellRedirection.heldKey
+        or input.UserInputType==shellRedirection.heldKey) then shellRedirection.release() end
 end
 function shellRedirection.select(cam, pixel, origin)
     shellRedirection.focused = nil
@@ -1273,20 +1326,24 @@ function shellRedirection.select(cam, pixel, origin)
             local point, visible = cam:WorldToViewportPoint(part.Position)
             local distance = (point.X-pixel.X)^2 + (point.Y-pixel.Y)^2
             if visible and point.Z > 0 and distance <= radiusSquared then
-                -- Keep only the four nearest candidates, bounding visibility rays.
+                -- No sightline check needs only the nearest projected enemy.
+                local limit = Settings.ShellVisibilityCheck and 4 or 1
                 local index = 1
                 while candidates[index] and candidates[index].focusDistance <= distance do index += 1 end
-                if index <= 4 then
+                if index <= limit then
                     record.focusDistance=distance
                     table.insert(candidates,index,record)
-                    if #candidates > 4 then table.remove(candidates) end
+                    if #candidates > limit then table.remove(candidates) end
                 end
             end
         end
     end
     for _, record in ipairs(candidates) do
-        shellRedirection.focusRays=(shellRedirection.focusRays or 0)+1
-        local hit = workspace:Raycast(origin,record.part.Position-origin,aimWorldParams)
+        local hit
+        if Settings.ShellVisibilityCheck then
+            shellRedirection.focusRays=(shellRedirection.focusRays or 0)+1
+            hit = workspace:Raycast(origin,record.part.Position-origin,aimWorldParams)
+        end
         if not hit or hit.Instance:IsDescendantOf(record.character) then
             shellRedirection.focused = record.player
             shellRedirection.focusedPart = record.part
@@ -1335,29 +1392,29 @@ end
 if not original then return end
 @STEER@
 local oldStatus = actor:GetAttribute("AttributeShellRedirectStatus")
-local cachedHeartbeat,cachedPosition,cachedVelocity
-local refreshedAt = -math.huge
+local cached, connections = {},{}
+for _, key in ipairs({"Owner","Held","Heartbeat","Position","Velocity"}) do
+    local attribute = "AttributeShellRedirect"..key
+    cached[key] = player:GetAttribute(attribute)
+    connections[#connections+1] = player:GetAttributeChangedSignal(attribute):Connect(function()
+        local ok,value=pcall(player.GetAttribute,player,attribute)
+        if ok then cached[key]=value else cached.Error=tostring(value) end
+    end)
+end
 local wrapper
 wrapper = function(state, ...)
-    -- Most callbacks are other players' shells, impacts or unsupported behaviors.
-    -- Skip all cross-Actor attribute reads for those states.
+    -- Instance access belongs to the signal callbacks, never the native
+    -- per-projectile hot path. Only the simulation table is touched here.
     if type(state)=="table" and state.replicate==true and state.Behavior=="Default"
         and not state.destroy and not state.hitray and not state.physicalprojectile
-        and player:GetAttribute("AttributeShellRedirectOwner")==owner
-        and player:GetAttribute("AttributeShellRedirectHeld")==true
+        and cached.Owner==owner and cached.Held==true and not cached.Error
     then
         local now=os.clock()
-        if now-refreshedAt>=0.05 then
-            cachedHeartbeat=player:GetAttribute("AttributeShellRedirectHeartbeat")
-            cachedPosition=player:GetAttribute("AttributeShellRedirectPosition")
-            cachedVelocity=player:GetAttribute("AttributeShellRedirectVelocity")
-            refreshedAt=now
-        end
-        if type(cachedHeartbeat)=="number" and now-cachedHeartbeat<0.75
-            and cachedPosition and cachedVelocity then
-            local ok, err = pcall(steer,state,cachedPosition,cachedVelocity)
-            if not ok then
-                actor:SetAttribute("AttributeShellRedirectStatus", owner.."|error: "..tostring(err))
+        if type(cached.Heartbeat)=="number" and now-cached.Heartbeat<0.75
+            and cached.Position and cached.Velocity then
+            local ok, err = pcall(steer,state,cached.Position,cached.Velocity)
+            if not ok and not cached.Error then
+                cached.Error=tostring(err)
             end
         end
     end
@@ -1366,13 +1423,18 @@ end
 env.simulatebullet = wrapper
 actor:SetAttribute("AttributeShellRedirectStatus",owner)
 task.spawn(function()
+    local errorPublished=false
     while player.Parent and actor.Parent and env.simulatebullet==wrapper do
-        local heartbeat = player:GetAttribute("AttributeShellRedirectHeartbeat")
-        if player:GetAttribute("AttributeShellRedirectOwner")~=owner or type(heartbeat)~="number"
-            or os.clock()-heartbeat >= 0.75 then break end
+        if cached.Error and not errorPublished then
+            actor:SetAttribute("AttributeShellRedirectStatus", owner.."|error: "..cached.Error)
+            errorPublished=true
+        end
+        if cached.Owner~=owner or type(cached.Heartbeat)~="number"
+            or os.clock()-cached.Heartbeat >= 0.75 then break end
         task.wait(0.2)
     end
     if env.simulatebullet==wrapper then env.simulatebullet=original end
+    for _, connection in ipairs(connections) do connection:Disconnect() end
     if actor.Parent then
         local status = actor:GetAttribute("AttributeShellRedirectStatus")
         if type(status)=="string" and status:sub(1,#owner)==owner then
@@ -1566,14 +1628,21 @@ function shellRedirection.frame(cam)
     local source = Settings.Freecam and freecamActive and "Mouse" or Settings.AimSource
     local pixel = source=="Mouse" and UserInputService:GetMouseLocation() or cam.ViewportSize*0.5
     local now=os.clock()
+    if shellRedirection.held and shellRedirection.heldKey~=Settings.ShellFocusKey then
+        shellRedirection.release()
+    end
     if shellRedirection.isEngaged() then
-        refreshAimFilters(getActiveTank())
         -- Membership/visibility acquisition is capped; current bounds are still
         -- checked each rendered frame so leaving the circle clears immediately.
         if not shellRedirection.nextFocusScan or now>=shellRedirection.nextFocusScan then
             shellRedirection.nextFocusScan=now+0.05
-            local ray=cam:ViewportPointToRay(pixel.X,pixel.Y)
-            shellRedirection.select(cam,pixel,ray.Origin)
+            shellRedirection.refreshPlayers(now)
+            local origin
+            if Settings.ShellVisibilityCheck then
+                refreshAimFilters(getActiveTank())
+                origin=cam:ViewportPointToRay(pixel.X,pixel.Y).Origin
+            end
+            shellRedirection.select(cam,pixel,origin)
         else
             local record=shellRedirection.focusedRecord
             local valid=record and record.player.Parent==Players and record.player.Character==record.character
@@ -2067,8 +2136,8 @@ stylePanel(infoDistLabel)
 stylePanel(infoSubLabel)
 
 local function hideBlastZone()
-    blastZone.Transparency = 1
-    blastDistance.gui.Enabled = false
+    if blastZone.Transparency ~= 1 then blastZone.Transparency = 1 end
+    if blastDistance.gui.Enabled then blastDistance.gui.Enabled = false end
 end
 
 local function showBlastZone(center, normal, trueRadius, color, distanceStuds, eta)
@@ -2093,10 +2162,10 @@ end
 local lastPreviewState = nil
 local function hideVisuals()
     lastPreviewState = nil
-    borePreview.beam.Enabled = false
-    leadPreview.beam.Enabled = false
+    if borePreview.beam.Enabled then borePreview.beam.Enabled = false end
+    if leadPreview.beam.Enabled then leadPreview.beam.Enabled = false end
     hideBlastZone()
-    impactHud.Visible = false
+    if impactHud.Visible then impactHud.Visible = false end
 end
 
 -- Reuse raycast settings while seated; allocating and configuring them every
@@ -2157,7 +2226,7 @@ RunService:BindToRenderStep(VISUAL_RENDER_NAME, FREECAM_PRIORITY + 2, function()
     visualDiagnostics.frameMs = previousVisualFrame > 0 and (frameTime - previousVisualFrame) * 1000 or 0
     previousVisualFrame = frameTime
     if refreshAimCache then refreshAimCache() end
-    if not Settings.EnableAutoLead or not (Settings.Trajectory or Settings.ShowBallistic
+    if Settings.ShellRedirection or not Settings.EnableAutoLead or not (Settings.Trajectory or Settings.ShowBallistic
         or Settings.ExplosionRadius or Settings.ShowDistance or Settings.FlightTimer) then
         hideVisuals()
         visualDiagnostics.blastVisible = false
@@ -2166,6 +2235,9 @@ RunService:BindToRenderStep(VISUAL_RENDER_NAME, FREECAM_PRIORITY + 2, function()
         visualDiagnostics.plannedAim = false
         visualDiagnostics.assistReady = false
         visualDiagnostics.hit = nil
+        visualDiagnostics.rays = 0
+        visualDiagnostics.lastMs = 0
+        visualDiagnostics.flightTime = 0
         return
     end
     -- The Beam is engine-rendered; refreshing its endpoint on the same frame as
@@ -2258,7 +2330,7 @@ RunService:BindToRenderStep(VISUAL_RENDER_NAME, FREECAM_PRIORITY + 2, function()
     local simSteps = math.clamp(math.ceil(flightTime / 0.18), 8, 120)
     local simDt = flightTime / simSteps
 
-    local aimRequested = Settings.AdaptiveAim
+    local aimRequested = isAdaptiveAimActive()
     local plannedAim = aimRequested and previewDirection ~= nil
     local assistedAim = aimRequested and aimCache.direction ~= nil and aimCache.reason == "ready"
     -- An invalid finite cursor target must not silently become the bore path.
@@ -2815,7 +2887,9 @@ RunService:BindToRenderStep("AttributePlayerESP", FREECAM_PRIORITY + 4, function
     local now = os.clock()
     local camera = workspace.CurrentCamera
     if not camera then return end
+    local focusStarted=os.clock()
     local focusOK,focusError=pcall(shellRedirection.frame,camera)
+    shellRedirection.frameMs=(os.clock()-focusStarted)*1000
     if not focusOK then
         shellRedirection.error=tostring(focusError); shellRedirection.failed=true
         pcall(shellRedirection.release); pcall(shellRedirection.stop)
@@ -2982,45 +3056,53 @@ function shotTracker.attach(entry, state)
         entry.started = os.clock() - math.clamp(workspace:GetServerTimeNow() - state.timefired, 0, 60)
     end
     entry.lastPosition, entry.lastMoved = state.position, os.clock()
-    local w = entry.weapon
-    local duration = math.max(entry.predictedTime or 0, 2 * math.max(entry.initialVelocity.Y, 0) / math.max(math.abs(w.gravity), 1) + 3)
-    duration = math.min(duration,ballistics.lifetime(state))
-    local steps = math.clamp(math.ceil(duration / 0.18), 8, 120)
-    local finish, hit, time, _, endVelocity = traceTrajectory(entry.start, entry.initialVelocity,
-        w.gravity, w.drag, getTrajectoryParams(entry.vehicle), steps, duration / steps)
-    entry.expectedTime, entry.expectedEnd, entry.expectedHit = time, finish, hit ~= nil
-    -- A full forecast is retained, but completed geometry comes from observed
-    -- movement. Pixel-width segments avoid subpixel world-Beam stippling.
-    local p0 = entry.start
-    entry.samples, entry.pathLength = { { point = p0, length = 0 } }, 0
-    for i = 1, 48 do
-        local point = ballistics.sample(entry.start,entry.initialVelocity,w.gravity,w.drag,time*i/48)
-        if i == 48 then point = finish end
-        entry.pathLength = entry.pathLength + (point - entry.samples[#entry.samples].point).Magnitude
-        entry.samples[#entry.samples + 1] = { point = point, length = entry.pathLength }
+    entry.redirectionFlight = entry.redirectionFlight or Settings.ShellRedirection
+    if entry.redirectionFlight then
+        -- A steerable flight has no fixed impact/ETA forecast. Keep only the
+        -- observed-shell marker; do not allocate 98 forecast segment Frames.
+        entry.samples = {}
+        shotTracker.makeFlightOverlay(entry)
+    else
+        local w = entry.weapon
+        local duration = math.max(entry.predictedTime or 0, 2 * math.max(entry.initialVelocity.Y, 0) / math.max(math.abs(w.gravity), 1) + 3)
+        duration = math.min(duration,ballistics.lifetime(state))
+        local steps = math.clamp(math.ceil(duration / 0.18), 8, 120)
+        local finish, hit, time, _, endVelocity = traceTrajectory(entry.start, entry.initialVelocity,
+            w.gravity, w.drag, getTrajectoryParams(entry.vehicle), steps, duration / steps)
+        entry.expectedTime, entry.expectedEnd, entry.expectedHit = time, finish, hit ~= nil
+        -- A full forecast is retained, but completed geometry comes from observed
+        -- movement. Pixel-width segments avoid subpixel world-Beam stippling.
+        local p0 = entry.start
+        entry.samples, entry.pathLength = { { point = p0, length = 0 } }, 0
+        for i = 1, 48 do
+            local point = ballistics.sample(entry.start,entry.initialVelocity,w.gravity,w.drag,time*i/48)
+            if i == 48 then point = finish end
+            entry.pathLength = entry.pathLength + (point - entry.samples[#entry.samples].point).Magnitude
+            entry.samples[#entry.samples + 1] = { point = point, length = entry.pathLength }
+        end
+        shotTracker.makeFlightOverlay(entry)
+        entry.zone = blastZone:Clone()
+        entry.zone.Name = "ConfirmedShotTarget"
+        entry.zone.Size = Vector3.new(0.12, 8, 8)
+        local normal = hit and hit.Normal or Vector3.yAxis
+        local right = normal:Cross(Vector3.zAxis)
+        if right.Magnitude < 0.1 then right = normal:Cross(Vector3.xAxis) end
+        entry.zone.CFrame = CFrame.fromMatrix(finish + normal * 0.24, normal, right.Unit)
+        entry.zone.Color = THEME.FlightEnd
+        entry.zone.Transparency = 0.48
+        entry.zone.Parent = visualContainer
+        entry.visuals[#entry.visuals + 1] = entry.zone
+        entry.targetHud = blastDistance.gui:Clone()
+        entry.targetHud.Name = "ConfirmedShotETA"
+        entry.targetHud.Adornee = entry.zone
+        entry.targetHud.Size = UDim2.fromOffset(190, 38)
+        entry.targetHud.StudsOffsetWorldSpace = Vector3.new(0, 3.5, 0)
+        entry.targetHud.Enabled = true
+        entry.targetHud.Parent = visualContainer
+        entry.targetText = entry.targetHud:FindFirstChildOfClass("TextLabel")
+        -- Keep the cloned label's automatic, tightly padded text bounds.
+        entry.visuals[#entry.visuals + 1] = entry.targetHud
     end
-    shotTracker.makeFlightOverlay(entry)
-    entry.zone = blastZone:Clone()
-    entry.zone.Name = "ConfirmedShotTarget"
-    entry.zone.Size = Vector3.new(0.12, 8, 8)
-    local normal = hit and hit.Normal or Vector3.yAxis
-    local right = normal:Cross(Vector3.zAxis)
-    if right.Magnitude < 0.1 then right = normal:Cross(Vector3.xAxis) end
-    entry.zone.CFrame = CFrame.fromMatrix(finish + normal * 0.24, normal, right.Unit)
-    entry.zone.Color = THEME.FlightEnd
-    entry.zone.Transparency = 0.48
-    entry.zone.Parent = visualContainer
-    entry.visuals[#entry.visuals + 1] = entry.zone
-    entry.targetHud = blastDistance.gui:Clone()
-    entry.targetHud.Name = "ConfirmedShotETA"
-    entry.targetHud.Adornee = entry.zone
-    entry.targetHud.Size = UDim2.fromOffset(190, 38)
-    entry.targetHud.StudsOffsetWorldSpace = Vector3.new(0, 3.5, 0)
-    entry.targetHud.Enabled = true
-    entry.targetHud.Parent = visualContainer
-    entry.targetText = entry.targetHud:FindFirstChildOfClass("TextLabel")
-    -- Keep the cloned label's automatic, tightly padded text bounds.
-    entry.visuals[#entry.visuals + 1] = entry.targetHud
     entry.part = state.projectile or (state.physicalprojectile and state.physicalprojectile.proj)
     -- Outline only the real projectile; never create an enlarged proxy ball or
     -- adorn an attachment's ancestor model (which could be the entire tank).
@@ -3153,6 +3235,7 @@ function shotTracker.screenSegment(cam, a, b)
 end
 
 function shotTracker.drawFlight(entry, cam)
+    if entry.redirectionFlight then shotTracker.drawShell(entry,cam); return end
     local n = #entry.samples - 1
     local progress = math.clamp(entry.progress or 0, 0, 0.9999)
     local position = entry.state.position
@@ -3193,7 +3276,10 @@ function shotTracker.drawFlight(entry, cam)
         draw(previous, point, false, (i - 1) / n)
         previous = point
     end
-    local point, visible = cam:WorldToViewportPoint(position)
+    shotTracker.drawShell(entry,cam)
+end
+function shotTracker.drawShell(entry, cam)
+    local point, visible = cam:WorldToViewportPoint(entry.state.position)
     local adorn = entry.shellAdornee
     local usable = entry.shellHighlight and adorn and adorn.Parent ~= nil
         and adorn.Transparency < 1 and adorn.LocalTransparencyModifier < 1 and point.Z > 0
@@ -3203,10 +3289,12 @@ function shotTracker.drawFlight(entry, cam)
         usable = pixels >= 3
     end
     if entry.shellHighlight then
-        entry.shellHighlight.Enabled = Settings.OwnShellHighlight and usable == true
+        shellRedirection.assign(entry.shellHighlight,"Enabled",Settings.OwnShellHighlight and usable == true)
     end
-    entry.shellMarker.Visible = Settings.OwnShellHighlight and not usable and visible and point.Z > 0
-    entry.shellMarker.Position = UDim2.fromOffset(point.X, point.Y)
+    shellRedirection.assign(entry.shellMarker,"Visible",Settings.OwnShellHighlight and not usable and visible and point.Z > 0)
+    if entry.shellMarker.Visible then
+        shellRedirection.assign(entry.shellMarker,"Position",UDim2.fromOffset(point.X,point.Y))
+    end
 end
 
 function shotTracker.projectProgress(entry, position)
@@ -3251,27 +3339,36 @@ RunService:BindToRenderStep("AutoLeadShotTracking", FREECAM_PRIORITY + 3, functi
         end
         local state = entry.state
         if state and not entry.finished then
+            if Settings.ShellRedirection and not entry.redirectionFlight then
+                entry.redirectionFlight = true
+                for _, line in ipairs(entry.lines or {}) do line.border.Visible=false end
+                if entry.zone then entry.zone.Transparency=1 end
+                if entry.targetHud then entry.targetHud.Enabled=false end
+            end
             local elapsed = math.max(0.001, now - entry.started)
             local position = state.position
             -- Detect crossing the predicted impact point between observed
             -- samples; don't wait for a pooled projectile's delayed removal.
-            local travel = position - entry.lastPosition
-            local t = math.clamp((entry.expectedEnd - entry.lastPosition):Dot(travel)
-                / math.max(travel:Dot(travel), 1e-8), 0, 1)
-            local arrivalDistance = (entry.lastPosition + travel * t - entry.expectedEnd).Magnitude
-            local arrived = entry.expectedHit and elapsed >= entry.expectedTime * 0.5
-                and arrivalDistance <= 8
+            local arrivalDistance, arrived
+            if not entry.redirectionFlight then
+                local travel = position - entry.lastPosition
+                local t = math.clamp((entry.expectedEnd - entry.lastPosition):Dot(travel)
+                    / math.max(travel:Dot(travel), 1e-8), 0, 1)
+                arrivalDistance = (entry.lastPosition + travel * t - entry.expectedEnd).Magnitude
+                arrived = entry.expectedHit and elapsed >= entry.expectedTime * 0.5 and arrivalDistance <= 8
+            end
             if (position - entry.lastPosition).Magnitude > 0.05 then
                 entry.lastPosition, entry.lastMoved = position, now
                 entry.status = "AIRBORNE"
             end
-            entry.progress = math.max(entry.progress or 0, shotTracker.projectProgress(entry, position))
+            entry.progress = not entry.redirectionFlight
+                and math.max(entry.progress or 0, shotTracker.projectProgress(entry, position)) or nil
             entry.elapsed = elapsed
-            entry.eta = math.max(0, entry.expectedTime - elapsed)
+            entry.eta = not entry.redirectionFlight and math.max(0, entry.expectedTime - elapsed) or nil
             if state.destroy or arrived then
                 entry.finished = now
                 entry.status = state.hitray and "IMPACT OBSERVED" or "FLIGHT ENDED"
-                if state.visualOnly then
+                if state.visualOnly and not entry.redirectionFlight then
                     entry.impactError = arrived and arrivalDistance or (position - entry.expectedEnd).Magnitude
                     if entry.impactError <= math.max(12, math.min(50, entry.initialVelocity.Magnitude * 0.05)) then
                         entry.status, entry.progress, entry.eta = "ARRIVAL OBSERVED", 1, 0
@@ -3279,7 +3376,7 @@ RunService:BindToRenderStep("AutoLeadShotTracking", FREECAM_PRIORITY + 3, functi
                         entry.status = "FLIGHT ENDED BEFORE TARGET"
                     end
                 end
-                if state.hitray then
+                if state.hitray and not entry.redirectionFlight then
                     entry.impactError = (state.hitray.Position - entry.expectedEnd).Magnitude
                     if entry.impactError > math.max(12, entry.pathLength * 0.002) then
                         entry.status = "IMPACT BEFORE / AWAY FROM TARGET"
@@ -3302,16 +3399,18 @@ RunService:BindToRenderStep("AutoLeadShotTracking", FREECAM_PRIORITY + 3, functi
             end
         end
         if state and not entry.finished then
-            local show = Settings.ShotProgress
             shotTracker.drawFlight(entry, workspace.CurrentCamera)
-            entry.zone.Transparency = show and 0.48 or 1
-            entry.targetHud.Enabled = show and Settings.ShowDistance
-            blastDistance.scaleLabel(entry.targetHud, entry.targetText, entry.expectedEnd)
-            if now >= (entry.nextLabel or 0) then
-                entry.nextLabel = now + 0.05
-                local meters = (entry.expectedEnd - entry.start).Magnitude / 2.7777778
-                local eta = entry.eta and entry.eta > 0.05 and string.format("ETA ~%.1fs", entry.eta) or "ETA unavailable"
-                entry.targetText.Text = string.format("%.0f m  ·  %s  ·  %.0f%%", meters, eta, (entry.progress or 0) * 100)
+            if not entry.redirectionFlight then
+                local show = Settings.ShotProgress
+                entry.zone.Transparency = show and 0.48 or 1
+                entry.targetHud.Enabled = show and Settings.ShowDistance
+                blastDistance.scaleLabel(entry.targetHud, entry.targetText, entry.expectedEnd)
+                if now >= (entry.nextLabel or 0) then
+                    entry.nextLabel = now + 0.05
+                    local meters = (entry.expectedEnd - entry.start).Magnitude / 2.7777778
+                    local eta = entry.eta and entry.eta > 0.05 and string.format("ETA ~%.1fs", entry.eta) or "ETA unavailable"
+                    entry.targetText.Text = string.format("%.0f m  ·  %s  ·  %.0f%%", meters, eta, (entry.progress or 0) * 100)
+                end
             end
             latest = latest or entry
         end
@@ -3457,8 +3556,7 @@ local function updateArtillerySlave(wData, startPos, direction, arc)
     local hum = lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
     local seat = hum and hum.SeatPart
     local control = wData and wData.turret and wData.turret:FindFirstChild("Control")
-    local shouldSlave = Settings.ArtilleryAutoLay and Settings.EnableAutoLead
-        and Settings.AdaptiveAim
+    local shouldSlave = Settings.ArtilleryAutoLay and isAdaptiveAimActive()
         and Settings.Freecam and freecamActive and wData and wData.weapon
         and control and control.Value == seat and seat ~= nil
         and direction ~= nil and arc == "high"
@@ -3535,6 +3633,23 @@ refreshAimCache = function()
         local startPos = weapon.firePoint and weapon.firePoint.WorldPosition or muzzle.Position
         aimCache.startPos, aimCache.tankVelocity = startPos, muzzle.AssemblyLinearVelocity
         local boreDir = getBoreForwardDirection(weapon)
+        if Settings.ShellRedirection then
+            -- Redirection is exclusively a post-launch operation. Keep just
+            -- native fire/shot identity data; no mouse rays or ballistic solve.
+            releaseArtillerySlave()
+            aimCache.vehicle, aimCache.weapon, aimCache.updated = veh,weapon,now
+            aimCache.direction, aimCache.previewDirection = boreDir,nil
+            aimCache.targetPos, aimCache.targetVel, aimCache.targetPart, aimCache.hitNormal = nil,nil,nil,nil
+            aimCache.arc, aimCache.alignment, aimCache.bearingError = "barrel",1,0
+            aimCache.barrelElevation = math.deg(math.asin(math.clamp(boreDir.Y,-1,1)))
+            aimCache.launchElevation = aimCache.barrelElevation
+            aimCache.waitForAlignment, aimCache.solutionBlocked, aimCache.turretSlaveActive = false,false,false
+            aimCache.fireBlock = fireReadiness.check(veh,weapon)
+            aimCache.clearance, aimCache.reason = aimCache.fireBlock==nil,aimCache.fireBlock or "native fire; mid-air redirection"
+            local hint = "Fire normally; hold your lock key for mid-air redirection"
+            if hint ~= lastAimHint then setFreecamHint(hint); lastAimHint=hint end
+            return
+        end
         local direction, targetPos, targetVel, targetPart, hitNormal, arc, previewDirection = calculateShotDirection(veh, weapon, startPos, muzzle.AssemblyLinearVelocity, weapon.speed, weapon.gravity, weapon.drag, boreDir)
         aimCache.direction = direction
         aimCache.previewDirection = previewDirection
@@ -3557,10 +3672,10 @@ refreshAimCache = function()
         aimCache.turretSlaveActive = updateArtillerySlave(weapon, startPos, direction, arc)
         -- Low-arc correction has the same bearing guard in either camera.
         -- Only a selected high lob requires precise barrel alignment.
-        local slewing = Settings.EnableAutoLead and Settings.AdaptiveAim and arc == "high" and direction ~= nil
+        local slewing = isAdaptiveAimActive() and arc == "high" and direction ~= nil
             and aimCache.alignment < math.cos(math.rad(3))
         aimCache.waitForAlignment = slewing
-        aimCache.solutionBlocked = Settings.EnableAutoLead and Settings.AdaptiveAim
+        aimCache.solutionBlocked = isAdaptiveAimActive()
             and targetPart ~= nil and direction == nil
         if aimCache.solutionBlocked and not aimCache.fireBlock then aimCache.fireBlock = arc end
         if slewing and not aimCache.fireBlock then
@@ -3859,9 +3974,10 @@ local function hookSingleWeaponModule(wm)
             or bulletData.origin2 == trackedWeapon.muzzle
             or bulletData.misc and bulletData.misc.weaponfolder == trackedWeapon.weapon) and {
             weapon = trackedWeapon, vehicle = aimCache.vehicle, attempt = shotTracker.attempts,
-            sentAt = os.clock(), predictedTime = visualDiagnostics.flightTime
+            sentAt = os.clock(), predictedTime = visualDiagnostics.flightTime,
+            redirectionFlight = Settings.ShellRedirection
         } or nil
-        if Settings.EnableAutoLead and Settings.AdaptiveAim and bulletData
+        if isAdaptiveAimActive() and bulletData
             and bulletData.replicate == true and bulletData.directions then
             local originalDirection = bulletData.directions[1]
             local shotState = { applied = false, reason = "not checked", originalDirection = tostring(originalDirection), freecam = freecamActive, arc = aimCache.arc, highArc = aimCache.arc == "high", time = os.clock() }
@@ -4024,7 +4140,7 @@ local function installHooks()
             hookedWeaponHandler = wh
 
             wh.fireWeapon = function(p56, p57, u58, p59, p60, p61, p62, p63)
-                if Settings.EnableAutoLead and Settings.AdaptiveAim
+                if isAdaptiveAimActive()
                     and aimCache.vehicle == p59 and aimCache.weapon and aimCache.weapon.weapon == u58
                     and (aimCache.waitForAlignment or aimCache.solutionBlocked) then
                     shotTracker.reject(aimCache.fireBlock or "No ready adaptive shot solution")
@@ -4111,7 +4227,7 @@ triggerDirectFire = function()
     end
     -- Invalid finite targets and pending high arcs were rejected above.
     -- With assistance disabled, retain the normal bore direction.
-    local aimDirection = Settings.EnableAutoLead and Settings.AdaptiveAim
+    local aimDirection = isAdaptiveAimActive()
         and aimCache.reason == "ready" and aimCache.direction or boreDir
     local ok, fired = pcall(function()
         -- MTC inserts -p62 into bulletData.directions, so pass the negative
@@ -4156,12 +4272,15 @@ _G.AutoLeadAssistDiagnostics = function()
         clickTeleport = Settings.FreecamClickTP,
         heldFire = { active = next(heldFire.inputs) ~= nil, busy = heldFire.busy == true },
         adaptiveAim = Settings.AdaptiveAim,
+        adaptiveAimActive = isAdaptiveAimActive(),
         shellRedirection = { enabled = Settings.ShellRedirection, radiusPixels = Settings.ShellFocusRadius,
+            lockKey = tostring(Settings.ShellFocusKey), visibilityCheck = Settings.ShellVisibilityCheck,
+            launchAssistsSuspended = Settings.ShellRedirection,
             held = shellRedirection.held, engaged = shellRedirection.isEngaged() == true,
             focusedPlayer = shellRedirection.focused and shellRedirection.focused.Name or nil,
             readyActors = shellRedirection.ready or 0, error = shellRedirection.error,
             focusScans = shellRedirection.focusScans, focusRays = shellRedirection.focusRays,
-            visualWrites = shellRedirection.visualWrites },
+            visualWrites = shellRedirection.visualWrites, frameMs = shellRedirection.frameMs },
         infiniteAmmo = Settings.InfiniteAmmo,
         vehicleExtras = { localEdits = #extras.edits, error = extras.tuningError,
             turretSpeedEnabled = Settings.TurretSpeedEnabled, rapidFireEnabled = Settings.TankRapidFire },

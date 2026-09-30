@@ -11,13 +11,32 @@ return function(source, returnFixture)
 local passed=0
 local function check(value,label) assert(value,label);passed+=1 end
 local Settings={ShellRedirection=true,ShellFocusRadius=60,ShellFocusCircle=true,ShellFocusTracer=true,
+    ShellFocusKey=Enum.UserInputType.MouseButton2,ShellVisibilityCheck=false,
     ShellFocusHighlight=true,ShellFocusColor=Color3.fromRGB(255,209,90)}
-local shellRedirection={players={},candidates={},held=true}
+local shellRedirection={players={},records={},candidates={},held=true,heldKey=Settings.ShellFocusKey}
 local Players={}
 local attrs={AttributeShellRedirectOwner="fixture",AttributeShellRedirectHeartbeat=os.clock(),AttributeShellRedirectHeld=true}
 local attributeReads=0
+local attributeSignals={}
+local attributeDisconnects=0
 local lp={Team="blue",Parent=true,PlayerGui={},GetAttribute=function(_,k) attributeReads+=1;return attrs[k] end,
-    SetAttribute=function(_,k,v)attrs[k]=v end}
+    SetAttribute=function(_,k,v)
+        if attrs[k]==v then return end
+        attrs[k]=v
+        for _,connection in ipairs(attributeSignals[k] or {}) do
+            if connection.callback then connection.callback() end
+        end
+    end,
+    GetAttributeChangedSignal=function(_,k)
+        attributeSignals[k]=attributeSignals[k] or {}
+        return {Connect=function(_,fn)
+            local connection={callback=fn,Disconnect=function(self)
+                self.callback=nil;attributeDisconnects+=1
+            end}
+            table.insert(attributeSignals[k],connection)
+            return connection
+        end}
+    end}
 local textbox=nil
 local UserInputService={GetFocusedTextBox=function()return textbox end}
 local aimWorldParams={}
@@ -30,12 +49,32 @@ local camera={ViewportSize=Vector2.new(1280,720),WorldToViewportPoint=function(_
 local function record(x,team)
     local character={}
     local part={Parent=character,Position=Vector3.new(x,0,100),AssemblyLinearVelocity=Vector3.zero,
+        IsA=function(_,class)return class=="BasePart" end,
         IsDescendantOf=function(_,model)return model==character end}
     local player={Parent=Players,Team=team or "red",Neutral=false,Character=character}
-    return {player=player,character=character,part=part,humanoid={Health=100}}
+    local humanoid={Health=100,Parent=character}
+    character.FindFirstChildOfClass=function()return humanoid end
+    character.FindFirstChild=function(_,name)if name=="UpperTorso" then return part end end
+    return {player=player,character=character,part=part,humanoid=humanoid}
 end
-]]..section('function shellRedirection.isEngaged(', '-- Runs inside each native projectile Actor')..steerSource..[[
+]]..section('local function normalizeFocusKey(', 'local adaptiveAim =')
+    ..section('function shellRedirection.refreshPlayers(', '-- Runs inside each native projectile Actor')..steerSource..[[
 local a,b=record(10),record(20)
+check(normalizeFocusKey("Enum.KeyCode.F")==Enum.KeyCode.F,"keyboard binding strings normalize")
+check(normalizeFocusKey("Enum.UserInputType.MouseButton2")==Enum.UserInputType.MouseButton2,"mouse binding strings normalize")
+check(not normalizeFocusKey("Enum.KeyCode.Unknown") and not normalizeFocusKey("None"),"unbound sentinel cannot engage")
+local roster={a.player,b.player}
+local rosterReads=0
+Players.GetPlayers=function()rosterReads+=1;return roster end
+shellRedirection.refreshPlayers(1)
+local cachedRecord=shellRedirection.records[a.player]
+shellRedirection.refreshPlayers(1.1)
+check(rosterReads==1,"roster rebuilds capped at two per second")
+shellRedirection.refreshPlayers(1.5)
+check(shellRedirection.records[a.player]==cachedRecord,"unchanged roster reuses character records")
+b.player.Parent=nil;shellRedirection.refreshPlayers(2)
+check(not shellRedirection.records[b.player],"departed player removed from record cache")
+b.player.Parent=Players
 shellRedirection.players={a,b}
 local rmb={UserInputType=Enum.UserInputType.MouseButton2}
 shellRedirection.release()
@@ -51,6 +90,10 @@ check(shellRedirection.isEngaged(),"other button release keeps RMB hold")
 local pos=shellRedirection.select(camera,Vector2.zero,Vector3.zero)
 check(pos==a.part.Position and shellRedirection.focused==a.player,"nearest visible enemy selected")
 blocked[10]=true
+local raysBefore=rayCount
+pos=shellRedirection.select(camera,Vector2.zero,nil)
+check(pos==a.part.Position and rayCount==raysBefore,"visibility off selects projected enemy without rays")
+Settings.ShellVisibilityCheck=true
 pos=shellRedirection.select(camera,Vector2.zero,Vector3.zero)
 check(pos==b.part.Position,"occluded nearest yields next visible focus")
 blocked[20]=true
@@ -73,6 +116,18 @@ Settings.ShellRedirection=true;shellRedirection.players={};blocked={};rayCount=0
 for i=1,6 do shellRedirection.players[i]=record(i);blocked[i]=true end
 shellRedirection.select(camera,Vector2.zero,Vector3.zero)
 check(rayCount==4,"visibility rays capped at four")
+shellRedirection.release();Settings.ShellFocusKey=Enum.KeyCode.F
+shellRedirection.inputBegan(rmb,false)
+check(not shellRedirection.isEngaged(),"RMB does not activate a rebound keyboard lock")
+local fKey={UserInputType=Enum.UserInputType.Keyboard,KeyCode=Enum.KeyCode.F}
+shellRedirection.inputBegan(fKey,false)
+check(shellRedirection.isEngaged(),"chosen keyboard hold engages")
+shellRedirection.inputEnded(rmb)
+check(shellRedirection.isEngaged(),"other input release does not cancel chosen hold")
+shellRedirection.inputEnded(fKey)
+check(not shellRedirection.isEngaged(),"chosen keyboard release clears hold")
+Settings.ShellFocusKey=Enum.UserInputType.MouseButton2
+shellRedirection.inputBegan(rmb,false)
 local function state()
     return {replicate=true,Behavior="Default",position0=Vector3.zero,position=Vector3.new(20,0,0),velocity=Vector3.xAxis*100}
 end
@@ -113,7 +168,7 @@ local task={spawn=function(fn)cleanup=fn end,wait=function()error("unexpected fi
         :gsub('@STEER@',function()return steerSource end)
     code=code..actorSource..[[
 check(environment.simulatebullet~=original and actorAttrs.AttributeShellRedirectStatus=="fixture","Actor environment hook confirms installation")
-attrs.AttributeShellRedirectPosition=target;attrs.AttributeShellRedirectVelocity=Vector3.zero
+lp:SetAttribute("AttributeShellRedirectPosition",target);lp:SetAttribute("AttributeShellRedirectVelocity",Vector3.zero)
 s=state()
 local results=table.pack(environment.simulatebullet(s))
 check(s.velocity.Y>99 and calls==1,"wrapper steers before native simulation display")
@@ -123,11 +178,11 @@ for i=1,100 do local foreign=state();foreign.replicate=false;environment.simulat
 check(attributeReads==readsBefore,"other players' shells require no Actor attribute reads")
 readsBefore=attributeReads
 for i=1,10 do environment.simulatebullet(state()) end
-check(attributeReads-readsBefore<=23,"own shells reuse position velocity and heartbeat within refresh interval")
-attrs.AttributeShellRedirectHeld=false
+check(attributeReads==readsBefore,"own shell hot path performs zero Instance attribute reads")
+lp:SetAttribute("AttributeShellRedirectHeld",false)
 s=state();environment.simulatebullet(s)
 check(s.velocity==Vector3.xAxis*100,"Actor hold gate immediately prevents steering")
-attrs.AttributeShellRedirectHeld=true
+lp:SetAttribute("AttributeShellRedirectHeld",true)
 shellRedirection.active=true;shellRedirection.owner="fixture"
 shellRedirection.inputEnded(rmb)
 check(not shellRedirection.held and not shellRedirection.focused and attrs.AttributeShellRedirectHeld==false
@@ -135,11 +190,12 @@ check(not shellRedirection.held and not shellRedirection.focused and attrs.Attri
 shellRedirection.inputBegan(rmb,false);shellRedirection.release()
 check(not shellRedirection.isEngaged(),"focus-loss release cancels held input")
 shellRedirection.active=false
-attrs.AttributeShellRedirectOwner=nil
+lp:SetAttribute("AttributeShellRedirectOwner",nil)
 s=state();environment.simulatebullet(s)
 check(s.velocity==Vector3.xAxis*100,"disabled owner stops steering immediately")
 cleanup()
 check(environment.simulatebullet==original and actorAttrs.AttributeShellRedirectStatus==nil,"cleanup restores owned callback/status")
+check(attributeDisconnects==5,"Actor cleanup disconnects all target attribute listeners")
 ]]
     code=code..[[
 local created={}
@@ -150,7 +206,8 @@ local Instance={new=function(class)
 end}
 local THEME={TextPrimary=Color3.fromRGB(241,242,246)}
 ]]..section('function shellRedirection.assign(', 'function shellRedirection.frame(')..[[
-shellRedirection.held=true;shellRedirection.focused=b.player;shellRedirection.focusedPart=b.part
+shellRedirection.held=true;shellRedirection.heldKey=Settings.ShellFocusKey
+shellRedirection.focused=b.player;shellRedirection.focusedPart=b.part
 local pixel=Vector2.new(400,200)
 shellRedirection.draw(camera,pixel)
 local visuals=shellRedirection.visuals
@@ -194,9 +251,10 @@ local function getActiveTank()return nil end
 local freecamActive=false
 camera.ViewportPointToRay=function()return {Origin=Vector3.zero}end
 shellRedirection.update=function()end
+shellRedirection.refreshPlayers=function()end
 ]]..section('function shellRedirection.frame(', 'function shellRedirection.destroy(')..[[
 Settings.ShellRedirection=true;Settings.AimSource="Camera"
-shellRedirection.held=true;shellRedirection.nextFocusScan=nil
+shellRedirection.held=true;shellRedirection.heldKey=Settings.ShellFocusKey;shellRedirection.nextFocusScan=nil
 shellRedirection.players={b};blocked={}
 b.part.Position=Vector3.new(640,360,100)
 local scansBefore=shellRedirection.focusScans
@@ -209,6 +267,14 @@ local scans=shellRedirection.focusScans-scansBefore
 check(scans>0 and scans<=20,"120 render frames perform at most 20 acquisition scans")
 check(shellRedirection.focusRays-raysBefore<=20,"stable visible focus raycasts are rate limited")
 check(shellRedirection.focused==b.player and visuals.tracer.Visible,"throttled focus retains live target cues")
+Settings.ShellVisibilityCheck=false;simTime+=0.051
+local beforeRay=rayCount
+for i=1,120 do simTime+=1/120;shellRedirection.frame(camera) end
+check(rayCount==beforeRay,"visibility-off focus performs zero world raycasts over moving frames")
+Settings.ShellFocusKey=Enum.KeyCode.F;shellRedirection.frame(camera)
+check(not shellRedirection.held and not visuals.tracer.Visible,"rebinding during a hold clears old input")
+Settings.ShellFocusKey=Enum.UserInputType.MouseButton2;shellRedirection.inputBegan(rmb,false)
+simTime+=0.051;shellRedirection.frame(camera)
 b.part.Position=Vector3.new(2000,360,100)
 shellRedirection.frame(camera)
 check(not shellRedirection.focused and not visuals.tracer.Visible,"leaving FOV clears between acquisition scans")
@@ -231,6 +297,75 @@ check(disconnected==3 and visuals.gui.destroyed and visuals.highlight.destroyed 
     "unload removes owned input handlers and visual objects")
 check(shellRedirection.destroyed and not shellRedirection.isEngaged() and Settings.ShellRedirection,
     "unload prevents reengagement without changing remembered toggle")
+]]
+    code=code..[[
+Settings.OwnShellHighlight=true
+local flightCalls,forecastCalls,drawCalls,removeCalls=0,0,0,0
+local visualContainer={}
+local ballistics={lifetime=function()return 60 end}
+local function traceTrajectory()forecastCalls+=1;error("unexpected forecast in redirection")end
+local shotTracker={queue={},entries={},candidates={},observed=0,attempts=1,
+    makeFlightOverlay=function(entry)flightCalls+=1;entry.shellMarker={} end,
+    announce=function()end,remove=function()removeCalls+=1 end,
+    projectProgress=function()error("unexpected fixed-route projection")end}
+]]..section('function shotTracker.attach(', 'function shotTracker.discover(')
+    ..section('function shotTracker.drawShell(', 'function shotTracker.projectProgress(')..[[
+local entry={sentAt=simTime,weapon={gravity=-10},attempt=1}
+local projectile={position0=Vector3.zero,velocity0=Vector3.xAxis*100,position=Vector3.new(20,0,100),Lifetime=60}
+shotTracker.attach(entry,projectile)
+check(entry.redirectionFlight and #entry.samples==0 and forecastCalls==0,"steerable launch has no collision forecast or sampled route")
+check(flightCalls==1 and not entry.zone and not entry.targetHud,"steerable launch creates marker without forecast lines or target HUD")
+shotTracker.drawShell(entry,camera)
+check(entry.shellMarker.Visible and entry.shellMarker.Position.X.Offset==20,"actual observed shell marker remains available")
+shotTracker.drawFlight=function(value,cam)drawCalls+=1;shotTracker.drawShell(value,cam)end
+local RunService={BindToRenderStep=function(_,name,priority,fn)shotTracker.render=fn end}
+local FREECAM_PRIORITY=2000000
+workspace.CurrentCamera=camera
+]]..section('RunService:BindToRenderStep("AutoLeadShotTracking",', 'local fireReadiness =')..[[
+shotTracker.entries={entry};simTime+=0.1
+shotTracker.render()
+check(drawCalls==1 and not entry.finished and not entry.eta,"steerable flight tracks shell without fixed-endpoint ETA or arrival")
+projectile.destroy=true;simTime+=0.1;shotTracker.render()
+check(removeCalls==1 and #shotTracker.entries==0,"observed steerable flight end removes ESP")
+local legacy={state={position=Vector3.new(20,0,100)},started=simTime,lastPosition=Vector3.zero,
+    lastMoved=simTime,lines={{border={Visible=true}}},zone={Transparency=0.48},targetHud={Enabled=true},
+    shellMarker={},attempt=1,initialVelocity=Vector3.xAxis*100}
+shotTracker.entries={legacy};simTime+=0.1;shotTracker.render()
+check(legacy.redirectionFlight and not legacy.lines[1].border.Visible and legacy.zone.Transparency==1
+    and not legacy.targetHud.Enabled,"enabling redirection mid-flight pauses legacy route and impact HUD")
+]]
+    code=code..[[
+local keyData,resetLock
+local handle={Mode="Hold"}
+function handle:SetMode(mode)self.Mode=mode;keyData.OnChanged("Enum.KeyCode.F",mode)end
+function handle:Set(value)keyData.OnChanged("Enum.UserInputType.MouseButton2",value.Mode)end
+local aimTarget={Label=function()return {AddKeybind=function(_,data)keyData=data;return handle end}end,
+    Button=function()return {Add=function(_,label,fn)resetLock=fn end}end}
+local function settingToggle()end
+]]..section('settingToggle(aimTarget, "Shell Redirection",', 'settingToggle(aimTarget, "Target Visibility Check",')..[[
+check(keyData.Mode=="Hold" and type(resetLock)=="function","UI exposes hold rebind and RMB reset through library API")
+keyData.OnChanged("Enum.KeyCode.F","Hold")
+check(Settings.ShellFocusKey==Enum.KeyCode.F,"UI binding change reaches raw input setting")
+keyData.OnChanged("Enum.KeyCode.F","Toggle")
+check(handle.Mode=="Hold","lock key remains hold-to-engage even if menu mode changes")
+resetLock()
+check(Settings.ShellFocusKey==Enum.UserInputType.MouseButton2,"reset button restores RMB binding")
+local previewHidden,cacheRefreshes,beyondGuard=0,0,false
+local blastDistance={gui={Enabled=false}}
+local visualDiagnostics={rays=192,flightTime=20}
+local previousVisualFrame=0
+local VISUAL_RENDER_NAME="fixture-preview"
+local function refreshAimCache()cacheRefreshes+=1 end
+local function hideVisuals()previewHidden+=1 end
+RunService.BindToRenderStep=function(_,name,priority,fn)shotTracker.preview=fn end
+]]..section('RunService:BindToRenderStep(VISUAL_RENDER_NAME,', '-- The Beam is engine-rendered;')..[[
+beyondGuard=true
+    end,function(err)return tostring(err)end)
+    assert(ok,failure)
+end)
+shotTracker.preview()
+check(previewHidden==1 and cacheRefreshes==1 and not beyondGuard,"redirection skips all pre-shot preview tracing while retaining native weapon cache")
+check(visualDiagnostics.rays==0 and visualDiagnostics.flightTime==0,"paused preview diagnostics do not advertise stale rays or flight time")
 return {passed=passed,sceneMutations=false}
 ]]
     if returnFixture then return code end

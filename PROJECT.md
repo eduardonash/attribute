@@ -2,7 +2,23 @@
 
 ## 1. Overview
 
+### Native-launch redirection mode and configurable lock key (2026-09-29)
+
+**Aim → Targeting → Lock-on Key (Hold)** now chooses the redirection activation key. RMB remains the initial binding; **Reset Lock Key to RMB** restores it. Valid bindings are remembered across reloads. The control always uses hold mode: release, window focus loss, typing, or changing the binding clears engagement. UI-consumed input cannot engage it. Rebinding does not change freecam's independent RMB camera-look control; choose a separate keyboard key to lock without rotating freecam.
+
+**Target Visibility Check** is optional and initially off. Off selects the nearest living enemy projected inside the focus circle without sightline rays or rebuilding map ray filters. On retains the bounded four-candidate visibility check. Focus acquisition stays capped at 20 Hz, while a separate 2 Hz player roster reuses existing character records. Death, team changes, respawns and leaving the circle are validated each frame. Removing target visibility checks does not remove native shell collisions.
+
+While **Shell Redirection** is enabled, Adaptive Aim, launch-direction replacement, artillery auto-elevation, adaptive firing/alignment gates and pre-shot trajectory/blast forecasts are temporarily bypassed. Existing aim settings are preserved and take effect again on disable. Fire normally along the native gun direction, then hold the lock key over a player while the shell is airborne. Native weapon readiness, ammo, barrel clipping, spawn restrictions, freecam, zoom, ordinary ESP and shot notifications remain unchanged. Own-shell Highlight/marker tracking remains available.
+
+Steerable flights also omit fixed-route progress/ETA/impact forecasts: those predictions are no longer valid after changing an airborne shell's course. New steerable flights skip forecast collision traces and 98 segment Frames; flights already tracked when redirection is enabled hide the old route and impact HUD. Their ESP ends from observed projectile termination, tracking loss or lifetime, not from crossing a stale forecast endpoint. Such a flight keeps its no-forecast state even if redirection is later disabled; future ordinary shots regain forecasts.
+
+Actor adapters now receive target/hold/ownership data through five cached attribute-change listeners per Actor. Native per-projectile callbacks perform no Instance reads or writes, including for eligible own shells. Errors stop steering and publish once from the Actor monitor. Cleanup disconnects all five listeners and restores only owned callbacks. Diagnostics include `lockKey`, `visibilityCheck`, `launchAssistsSuspended`, `adaptiveAimActive` and focus `frameMs`; `visualWrites` also counts changed own-shell visual properties.
+
+Verification: a read-only snapshot of the old running revision showed redirection enabled with Adaptive Aim already off, yet the latest pre-shot preview still reported 192 collision rays. That identifies remaining preview work, not a proven sole cause of stutter. The revised full script compiled locally without execution; **134 assertions** passed (52 adaptive/native-fire and 82 redirection/input/UI/render/tracking checks). Tests cover configurable hold/release/reset, zero visibility-off targeting rays, zero Instance reads in native shell callbacks, roster reuse/listener cleanup, native launch preservation, suspended solver/fire gates with restoration, forecast omission, observed-shell ESP and mid-flight mode switching. No full live reload or shot was performed. Actual Roblox FPS, event scheduling and redirected impacts still need in-game verification. The Roblox inspection skill was used only for the read-only snapshots, not execution.
+
 ### Focus lock-on performance revision (2026-09-29)
+
+Earlier optimization; the native-launch mode and event-cached Actor path above supersede its always-on sightline checks and per-callback ownership reads.
 
 RMB focus acquisition now runs at most 20 times per second instead of on every rendered frame. It reuses cached player records rather than allocating candidate wrappers. The current target's life, team, respawn reference, viewport position and circle bounds are still checked each frame, so release, death and leaving the circle hide its cues immediately. Visibility raycasts remain bounded to four per scan; a newly occluded target can persist until the next scan (up to 50 ms).
 
@@ -194,6 +210,7 @@ Impact and shot-readout labels use bright text with a dark stroke over a faint d
 - `EnableAutoLead` remains the master assist/preview switch. `AdaptiveAim` replaces both `AutoLead` and `AutoBallistic`, defaults on for fresh settings, and always uses low-first selection. `Trajectory` defaults on; `ShowBallistic` (additional bore preview) defaults off. Old aiming flags are read only during enabled-state migration.
 - `ExplosionRadius` toggles the compact filled impact-zone cue; `ShowDistance` controls both the zone distance label and bottom-left distance readout. `FlightTimer` controls flight-time information.
 - `OwnShellHighlight`, `ShotProgress`, and `ShotStatus` independently toggle own-projectile highlighting, the flight completion path, and shot confirmation. They default on and are remembered across reloads.
+- `ShellRedirection` temporarily suspends launch assists and fixed-route forecasts without changing their saved switches. `ShellFocusKey` is a remembered hold binding (RMB initially); `ShellVisibilityCheck` defaults off and controls optional targeting sightline rays only.
 - `EnemyTankESP`, `PlayerESP`, `ESPNames`, `ESPHealth`, and `ESPBoxes` are separately toggleable and default on. Player ESP draws a projected body-size outline, name, and narrow health bar; enemy tanks use engine Highlights. Enemy filtering excludes the local player's team and neutral players. The scanners cap active markers at 16 nearby tanks and 24 nearby players.
 - `ESPColorIndex` selects red, cyan, yellow, or purple. `ESPMaxDistance` is a VibeUI slider with an editable value box: any whole-stud distance from `0` to `50,000`, rather than four presets. There is no ESP distance-label toggle.
 - `AimSource` starts as `"Mouse"` and can be changed to `"Camera"`; active freecam forces mouse aiming.
@@ -210,6 +227,7 @@ Impact and shot-readout labels use bright text with a dark stroke over a faint d
 | `Right Shift` / `Insert` | Toggle the VibeUI settings menu |
 | `V` (rebindable) or freecam toggle in settings | Toggle freecam navigation |
 | `Z` (rebindable) or zoom toggle in settings | Toggle camera zoom |
+| `RMB` (default; rebindable in Aim → Targeting) | Hold to focus a player and redirect an already-airborne shell while Shell Redirection is enabled; release stops steering |
 | `W, A, S, D` (Freecam) | Move Camera (Isolated from chassis) |
 | `Space` / `E` | Elevate Camera Up |
 | `Left Control` / `Q` | Lower Camera Down |

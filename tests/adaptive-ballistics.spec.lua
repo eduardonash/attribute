@@ -45,7 +45,9 @@ local function getActiveTank() return vehicle end
 local activeWeapon = weapon
 local function getActiveWeaponData() return activeWeapon end
 local selectedDirection, selectedArc = Vector3.new(1,1,0).Unit,"low"
+local solves=0
 local function calculateShotDirection()
+    solves+=1
     return selectedDirection,Vector3.new(800,0,0),Vector3.zero,true,Vector3.yAxis,selectedArc
 end
 local function getShotAlignment(a,b) return a:Dot(b) end
@@ -56,7 +58,9 @@ local function setFreecamHint() end
 local refreshAimCache
 local shellRedirection = {update=function() end}
 local wh = {}
-local shotTracker = {reject=function() end}
+local shotTracker = {reject=function() end,serial=0,attempts=1,queue={}}
+local hookedWeaponModules,extras={},{}
+local lastShotDiagnostics
 ]]
     local assertions = [[
 local function solve(distance, minPitch, maxPitch, lifetime, drag, elevated)
@@ -141,6 +145,31 @@ refreshAimCache()
 check(not aimCache.solutionBlocked and not aimCache.fireBlock, "assist disabled restores native firing")
 check(wh.fireWeapon(nil,nil,weapon.weapon,vehicle)=="native", "disabled assist bypasses native handler gate")
 Settings.AdaptiveAim=true
+selectedDirection,selectedArc=Vector3.new(1,1,0).Unit,"high"
+check(updateArtillerySlave(weapon,Vector3.zero,selectedDirection,"high"), "auto-lay active before redirection")
+Settings.ShellRedirection=true
+local solvesBefore=solves
+refreshAimCache()
+check(solves==solvesBefore,"redirection mode skips target ray and ballistic solving")
+check(aimCache.direction==bore and aimCache.targetPos==nil and aimCache.arc=="barrel","redirection caches native launch direction without cursor target")
+check(command.Value==Vector3.zero and not aimCache.turretSlaveActive,"redirection releases owned auto-elevation")
+check(not aimCache.solutionBlocked and not aimCache.waitForAlignment and not aimCache.fireBlock,"redirection clears adaptive fire rejection")
+check(wh.fireWeapon(nil,nil,weapon.weapon,vehicle)=="native","redirection permits ordinary native firing")
+check(Settings.AdaptiveAim and Settings.ArtilleryAutoLay and not isAdaptiveAimActive(),"assist settings preserved but effectively suspended")
+aimCache.solutionBlocked=true;aimCache.waitForAlignment=true
+check(wh.fireWeapon(nil,nil,weapon.weapon,vehicle)=="native","switching to redirection bypasses even stale adaptive gates")
+local module={FireBullet=function(_,data)
+    data.id="confirmed-shot";data.effectfired=true
+    return "emitted",nil,7
+end}
+hookSingleWeaponModule(module)
+local packet={replicate=true,origin=weapon.muzzle,directions={bore}}
+local emitted=table.pack(module:FireBullet(packet))
+check(packet.directions[1]==bore,"redirection preserves native projectile launch packet")
+check(emitted.n==3 and emitted[1]=="emitted" and emitted[3]==7,"native FireBullet returns preserved")
+check(shotTracker.serial==1 and shotTracker.queue[1].redirectionFlight,"confirmed own launch still queued for shell ESP without forecast")
+Settings.ShellRedirection=false;refreshAimCache()
+check(solves>solvesBefore and isAdaptiveAimActive(),"turning redirection off restores previous assist settings")
 activeWeapon=nil
 refreshAimCache()
 check(not aimCache.solutionBlocked and not aimCache.waitForAlignment, "seat exit clears stale firing flags")
@@ -150,12 +179,14 @@ return {passed=passed, sceneMutations=false}
         .. '\nlocal function migrate(rememberedSettings)\n'
         .. section("local adaptiveAim =", "local Settings =")
         .. '\nreturn adaptiveAim\nend\n'
+        .. section("local function isAdaptiveAimActive(", "-- Suppress only the visual")
         .. section("local ballistics =", "-- The target classes change")
         .. section("local function pathReachesTarget(", "-- Canonical MTC Explosion")
         .. section("local function traceTrajectory(", "-- Main Render Loop")
         .. section("ballistics.slave =", "extras.staffRoles =")
         .. section("wh.fireWeapon = function", "local held = heldFire.matches")
         .. '\nreturn "native"\nend\n'
+        .. section("local function hookSingleWeaponModule(", "-- Native gunner controllers debit")
         .. assertions
     if returnFixture then return fixture end
     return assert(loadstring(fixture, "adaptive-ballistics.spec"))()
