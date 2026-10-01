@@ -1,4 +1,5 @@
-# Publish only the current script; documentation and tests stay local.
+# Publish the current script and public README; internal documentation and tests stay local.
 /*
 !/.gitignore
 !/lumen.lua
+!/README.md
