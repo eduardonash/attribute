@@ -1,6 +1,16 @@
-# AutoLeadAssist: Project Documentation
+# Lumen: Project Documentation
 
 ## 1. Overview
+
+### Independent shell ESP and Lumen branding (2026-09-30)
+
+The canonical script is now `lumen.lua`, with **Lumen** in the window, notifications and console messages. The repository URL stays the same. `attribute.lua` forwards existing loaders to the new file; remembered settings, internal cleanup names and diagnostic APIs retain compatibility. Historical sections below describe older revisions.
+
+**Trajectory → Shell ESP** uses the existing `OwnShellHighlight` preference and is independent of assist, redirection, preview and flight-progress settings. Own-shot capture now snapshots ammunition from the native packet before dispatch mutates its name, and uses the native `originpos` CFrame after confirmed dispatch. It normalizes the launch direction as the game does. A missing or mismatched aiming cache cannot prevent an entry from being queued; cached vehicle motion is used only for a matching weapon. The existing local-dispatch confirmation remains required, and non-own packets do not create own-shell markers.
+
+Observed-shell overlays are created before optional forecast work. Shell-only and redirected flights allocate no forecast segment pool or collision trace. Forecast failures are recorded separately and cannot prevent the shell marker from rendering. The tracking callback draws shell ESP independently from the flight-progress renderer. Predicted arrival hides the progress UI while ESP remains attached to an observed shell until its actual tracked end. A small hollow screen ring remains visible at the observed shell position even when a native outline is considered usable, since an eligible Adornee does not guarantee a visible outline. Camera loss/off-screen state, the ESP toggle, observed flight end and unload hide or remove the visuals. Mid-flight redirection discards the obsolete forecast and retains the observed marker.
+
+Read-only Roblox MCP inspection confirmed that native dispatch writes `originpos` from the muzzle, mutates the ammunition name and marks `effectfired`; projectile creation normalizes direction and uses the ammunition speed (or boosted launch speed). Candidate orientation is matched to that native direction independently of inherited vehicle motion. The current client had no script loaded, so no live shot or revised-source execution was performed. Local source compilation and **359 assertions** passed, including 30 new checks for mode-independent capture, native data/return preservation, unconfirmed/non-own exclusion, moving-vehicle discovery, marker-only rendering, forecast-failure/arrival isolation, redirected movement, toggles and flight cleanup. Protected error cases use the same explicit Luau-Web fixture modeling described below. Live launch/appearance verification remains pending reload.
 
 ### Lightweight focused-player marker (2026-09-29)
 
@@ -175,7 +185,7 @@ Verification: full-source compilation and 22 isolated assertions passed for tank
 
 Added off-by-default on-foot freecam click teleport, held-fire repetition and a reversible active camera-spring sink. Full-source compilation passed without running the script. Isolated tests of the extracted code passed 22 input/fire/teleport assertions and six spring-wrapper assertions, including duplicate cooldown, release/focus/seat cleanup, return preservation, invalid teleport targets and callback restoration. These used mock firing and movement only. No real shot or teleport was performed, and this revision has not been reloaded into the live client; explosion behavior and server acceptance still need user verification.
 
-**AutoLeadAssist** is a client-side ballistics preview, aiming, freecam, and enemy-marking script for *[MTC] Multicrew Tank Combat* (Roblox Luau).
+**Lumen** is a client-side ballistics preview, aiming, freecam, and enemy-marking script for *[MTC] Multicrew Tank Combat* (Roblox Luau).
 
 It reads local vehicle, weapon, ammunition, and physics data to predict launch direction and impact. The preview is an estimate: map collisions, game-side projectile behavior, and server authority can make a fired shot differ from the displayed path. It does not give projectiles terrain or object noclip.
 
@@ -183,7 +193,7 @@ It reads local vehicle, weapon, ammunition, and physics data to predict launch d
 
 ## 2. Core Architecture
 
-The codebase (`attribute.lua`) has these main data paths:
+The codebase (`lumen.lua`) has these main data paths:
 
 ```mermaid
 flowchart TD

@@ -1,4 +1,4 @@
--- Call the returned function with attribute.lua's source in a Luau runtime
+-- Call the returned function with lumen.lua's source in a Luau runtime
 -- providing Vector2, Vector3 and CFrame. No live scene, input or remotes used.
 return function(source, returnFixture)
     local function section(first, last)
@@ -60,6 +60,8 @@ local shellRedirection = {update=function() end}
 local wh = {}
 local shotTracker = {reject=function() end,serial=0,attempts=1,queue={}}
 local hookedWeaponModules,extras={},{}
+local ShellModules={}
+local defaultGravity=-10
 local lastShotDiagnostics
 ]]
     local assertions = [[
@@ -187,7 +189,7 @@ return {passed=passed, sceneMutations=false}
         .. section("ballistics.slave =", "extras.staffRoles =")
         .. section("wh.fireWeapon = function", "local held = heldFire.matches")
         .. '\nreturn "native"\nend\n'
-        .. section("local function hookSingleWeaponModule(", "-- Native gunner controllers debit")
+        .. section("function shotTracker.captureLaunch(", "-- Native gunner controllers debit")
         .. assertions
     if returnFixture then return fixture end
     return assert(loadstring(fixture, "adaptive-ballistics.spec"))()
