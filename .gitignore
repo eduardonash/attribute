@@ -1,14 +1,4 @@
-# Track only the intended deliverables; keep local backups and credentials out.
+# Publish only the current script; documentation and tests stay local.
 /*
 !/.gitignore
-!/README.md
-!/PROJECT.md
-!/attribute.lua
 !/lumen.lua
-!/tests/
-/tests/*
-!/tests/adaptive-ballistics.spec.lua
-!/tests/shell-redirection.spec.lua
-!/tests/freecam-input.spec.lua
-!/tests/focus-performance.spec.lua
-!/tests/shell-esp.spec.lua
