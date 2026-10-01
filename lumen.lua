@@ -1,11 +1,3 @@
---[[
-    ===================================================================
-    LUMEN // MULTICREW TANK COMBAT — PROJECTILE BALLISTICS & VISUALS
-    Target: Multicrew Tank Combat (Place: 95721658376580)
-    Engine: Roblox Luau (Executor Context 8)
-    ===================================================================
-]]
-
 if _G.AutoLeadAssistUnload then
     pcall(_G.AutoLeadAssistUnload)
 end
