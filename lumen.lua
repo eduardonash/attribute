@@ -123,6 +123,7 @@ local Settings = {
     TurretSpeedMultiplier = math.clamp(tonumber(rememberedSettings.TurretSpeedMultiplier) or 1, 0.25, 3),
     TankRapidFire = rememberedSettings.TankRapidFire == true,
     RapidFireMultiplier = math.clamp(tonumber(rememberedSettings.RapidFireMultiplier) or 2, 1, 5),
+    QuickPlaceTertiary = rememberedSettings.QuickPlaceTertiary == true,
     StaffNotifications = rememberedSettings.StaffNotifications ~= false,
     CreatorNotifications = rememberedSettings.CreatorNotifications ~= false,
     EnemyTankESP = rememberedSettings.EnemyTankESP ~= false,
@@ -913,6 +914,14 @@ do
                 if extras.requestSupply then extras.requestSupply("Fuel", "jerry can") end
             end)
             supply:Paragraph({ Name = "Station required", Content = "Uses a nearby supply station within its normal pickup range. No remote spawning." })
+            local equipment = vehicleTab:Section({ Name = "Equipment", Side = 1 })
+            equipment:Toggle({ Name = "Quick Place Tertiary", Flag = "ALA_QuickPlaceTertiary",
+                Default = Settings.QuickPlaceTertiary,
+                Info = "Shorten the placement hold for your selected tertiary placeable. Normal range, terrain and server rules still apply.",
+                Callback = function(value)
+                    Settings.QuickPlaceTertiary = value == true
+                    if extras.quickPlace then extras.quickPlace.update() end
+                end })
             local tuning = vehicleTab:Section({ Name = "Turret & Firing", Side = 2 })
             settingToggle(tuning, "Turret Rotate Speed", "TurretSpeedEnabled", "Local occupied-turret speed override; restores on exit or disable.")
             tuning:Slider({ Name = "Turret Rotate Speed Slider", Min = 0.25, Max = 3,
@@ -4175,6 +4184,85 @@ function extras.requestSupply(stationName, label)
 end
 
 -- Reversible local table edits; neither helper emits shots or changes remotes.
+-- Quick placement affects only the equipped tertiary's local placement preview.
+-- Never invoke placement remotes, mutate placed buildings, or shorten destruction.
+extras.quickPlace = { edits = {}, connections = {} }
+function extras.quickPlace.restore(model, edit)
+    if model.Parent and model:GetAttribute("HoldingTime") == 0 then
+        model:SetAttribute("HoldingTime", edit.original)
+    end
+end
+function extras.quickPlace.clear()
+    local q = extras.quickPlace
+    for model, edit in pairs(q.edits) do q.restore(model, edit) end
+    table.clear(q.edits)
+end
+function extras.quickPlace.watch(key, object, signals)
+    local q = extras.quickPlace
+    if q[key] == object then return end
+    for _, conn in ipairs(q.connections[key] or {}) do conn:Disconnect() end
+    q.connections[key], q[key] = {}, object
+    if object then
+        for _, signal in ipairs(signals) do
+            table.insert(q.connections[key], signal:Connect(q.update))
+        end
+    end
+end
+function extras.quickPlace.update()
+    local q = extras.quickPlace
+    if not extras.alive or not Settings.QuickPlaceTertiary then q.clear(); return end
+    local gui = lp:FindFirstChild("PlayerGui")
+    local frame = gui and gui:FindFirstChild("EnterBattleGui")
+    for _, name in ipairs({ "MainFrame", "FrameContainer", "WeaponFrame", "TeritaryFrame" }) do
+        frame = frame and frame:FindFirstChild(name)
+    end
+    q.watch("frame", frame, frame and { frame.ChildAdded, frame.ChildRemoved } or {})
+    local states = ReplicatedStorage:FindFirstChild("States")
+    states = states and states:FindFirstChild("client")
+    states = states and states:FindFirstChild("BuildingScript")
+    local cloneState = states and states:FindFirstChild("CloneModel")
+    local heldState = states and states:FindFirstChild("HeldTool")
+    if cloneState and not cloneState:IsA("ObjectValue") then cloneState = nil end
+    if heldState and not heldState:IsA("ObjectValue") then heldState = nil end
+    q.watch("cloneState", cloneState, cloneState and { cloneState.Changed } or {})
+    q.watch("heldState", heldState, heldState and { heldState.Changed } or {})
+    local wanted = {}
+    local held = heldState and heldState.Value
+    local clone = cloneState and cloneState.Value
+    if frame then
+        for _, selected in ipairs(frame:GetChildren()) do
+            if selected:IsA("ViewportFrame") then
+                local name = held and held:IsA("Tool") and held:FindFirstChild("PlaceableName")
+                if name and name:IsA("StringValue") and name.Value == selected.Name
+                    and held.Parent == lp.Character and clone and clone:IsA("Model")
+                    and clone.Name == selected.Name then
+                    wanted[clone] = q.edits[clone] or { original = clone:GetAttribute("HoldingTime") }
+                end
+            end
+        end
+    end
+    for model, edit in pairs(q.edits) do
+        if not wanted[model] or not model.Parent then
+            q.restore(model, edit)
+            q.edits[model] = nil
+        end
+    end
+    for model, edit in pairs(wanted) do
+        if not q.edits[model] then
+            q.edits[model] = edit
+            model:SetAttribute("HoldingTime", 0)
+        end
+    end
+end
+function extras.quickPlace.destroy()
+    local q = extras.quickPlace
+    for _, connections in pairs(q.connections) do
+        for _, conn in ipairs(connections) do conn:Disconnect() end
+    end
+    table.clear(q.connections)
+    q.clear()
+end
+
 function extras.restoreEdits()
     for _, edit in ipairs(extras.edits) do
         if rawget(edit.target, edit.key) == edit.applied then edit.target[edit.key] = edit.original end
@@ -4330,6 +4418,14 @@ end
 extras.tick = RunService.Heartbeat:Connect(function()
     if not extras.alive or os.clock() < (extras.nextTick or 0) then return end
     extras.nextTick = os.clock() + 0.25
+    local placementOK, placementError = pcall(extras.quickPlace.update)
+    if not placementOK then
+        extras.quickPlace.clear()
+        if extras.quickPlace.error ~= tostring(placementError) then
+            extras.quickPlace.error = tostring(placementError)
+            extras.notify("Quick Place unavailable: " .. tostring(placementError))
+        end
+    end
     extras.flushShots()
     local foliageOK, foliageError = pcall(extras.foliage.update)
     if not foliageOK and extras.foliage.error ~= tostring(foliageError) then
@@ -4905,6 +5001,7 @@ end)
 _G.AutoLeadAssistUnload = function()
     extras.alive = false
     extras.tick:Disconnect()
+    extras.quickPlace.destroy()
     for _, conn in pairs(extras.foliage.roots) do conn:Disconnect() end
     extras.foliage.restore()
     extras.foliage.decoration(false)
