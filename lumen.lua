@@ -124,6 +124,8 @@ local Settings = {
     TankRapidFire = rememberedSettings.TankRapidFire == true,
     RapidFireMultiplier = math.clamp(tonumber(rememberedSettings.RapidFireMultiplier) or 2, 1, 5),
     QuickPlaceTertiary = rememberedSettings.QuickPlaceTertiary == true,
+    TertiaryPlacementBind = false,
+    TertiaryPlacementKey = normalizeFocusKey(rememberedSettings.TertiaryPlacementKey) or Enum.KeyCode.B,
     StaffNotifications = rememberedSettings.StaffNotifications ~= false,
     CreatorNotifications = rememberedSettings.CreatorNotifications ~= false,
     EnemyTankESP = rememberedSettings.EnemyTankESP ~= false,
@@ -918,17 +920,24 @@ do
             local equipment = vehicleTab:Section({ Name = "Equipment", Side = 1 })
             extras.tertiary.dropdown = equipment:Searchbox({ Name = "Tertiary Item", Items = {},
                 Flag = "ALA_TertiaryItem", Callback = function(value) extras.tertiary.selected = value end })
-            equipment:Button():Add("Open Nearby Tertiary Locker", function()
-                if extras.tertiary.open then extras.tertiary.open() end
-            end)
-            equipment:Button():Add("Request Selected Tertiary", function()
-                if extras.tertiary.request then extras.tertiary.request() end
+            equipment:Button():Add("Refresh Tertiary Catalog", function()
+                if extras.tertiary.refresh then extras.tertiary.refresh(true) end
             end)
             equipment:Button():Add("Equip Selected Tertiary", function()
                 if extras.tertiary.equip then extras.tertiary.equip() end
             end)
-            equipment:Paragraph({ Name = "Workspace tertiary lockers", Content =
-                "Move within normal range of a tertiary locker, then open it here. Choose an unlocked item and request it. Request submits your current full loadout; points, ownership and cooldown rules still apply. No teleporting or automatic grants." })
+            equipment:Button():Add("Activate Owned Tertiary", function()
+                if extras.tertiary.activateOwned then extras.tertiary.activateOwned() end
+            end)
+            settingToggle(equipment, "Enable Placement Bind", "TertiaryPlacementBind", "Off on load. Place the selected tertiary at the cursor using its normal placement request.")
+            equipment:Label("Placement Key"):AddKeybind({ Flag = "ALA_TertiaryPlacementKey",
+                Default = Settings.TertiaryPlacementKey, Mode = "Hold",
+                OnChanged = function(key)
+                    Settings.TertiaryPlacementKey = normalizeFocusKey(key)
+                end })
+            extras.tertiary.window = window
+            equipment:Paragraph({ Name = "Catalog placement", Content =
+                "Refresh, select a tertiary, enable the bind, then close Lumen and press the key while aiming at a valid nearby surface. Catalog templates are not proof of ownership. No locker, loadout grant, teleport or fake tool clone; server rules still apply." })
             equipment:Toggle({ Name = "Quick Place Tertiary", Flag = "ALA_QuickPlaceTertiary",
                 Default = Settings.QuickPlaceTertiary,
                 Info = "Shorten the placement hold for your selected tertiary placeable. Normal range, terrain and server rules still apply.",
@@ -4197,142 +4206,44 @@ function extras.requestSupply(stationName, label)
         or "Station activation failed; use it directly.")
 end
 
--- Reversible local table edits; neither helper emits shots or changes remotes.
--- Tertiary selection delegates to existing, accessible game UI buttons. No
--- fabricated tool clones, ownership changes, or direct inventory remotes.
-function extras.tertiary.context()
-    local gui = lp:FindFirstChild("PlayerGui")
-    gui = gui and gui:FindFirstChild("EnterBattleGui")
-    local main = gui and gui:FindFirstChild("MainFrame")
-    local container = main and main:FindFirstChild("FrameContainer")
-    local weapons = container and container:FindFirstChild("WeaponFrame")
-    return gui, weapons, gui and gui:FindFirstChild("SelectWeaponFrame")
-end
-function extras.tertiary.visible(object)
-    if not object or not object.Parent then return false end
-    while object do
-        if object:IsA("GuiObject") and not object.Visible then return false end
-        if object:IsA("ScreenGui") then return object.Enabled end
-        object = object.Parent
-    end
-    return false
-end
-function extras.tertiary.activate(button)
-    if not extras.alive or not button or not button:IsA("GuiButton")
-        or not button.Active or not extras.tertiary.visible(button) then
-        return false, "Open the game's normal loadout/resupply menu first."
-    end
-    if type(firesignal) ~= "function" then return false, "Use the game's selection buttons directly; UI activation is unavailable." end
-    local ok = pcall(firesignal, button.Activated)
-    if not ok then return false, "The game button could not be activated." end
-    return true
-end
-function extras.tertiary.rows()
+-- Direct tertiary placement: catalog selection is distinct from inventory grants.
+function extras.tertiary.refresh(announce)
     local t = extras.tertiary
-    local _, _, picker = t.context()
-    local header = picker and picker:FindFirstChild("Header")
-    local label = header and header:FindFirstChild("TextLabel")
-    local container = picker and picker:FindFirstChild("ButtonContainer")
-    local rows = {}
-    if not t.visible(picker) or not label or label.Text ~= "Choose Weapon - Tertiary" or not container then return rows end
-    for _, tier in ipairs(container:GetChildren()) do
-        local list = tier:FindFirstChild("Container")
-        if list then
-            for _, row in ipairs(list:GetChildren()) do
-                local button = row:FindFirstChild("SelectButton")
-                local lock = row:FindFirstChild("LockFrame")
-                if row:IsA("ViewportFrame") and button and button:IsA("GuiButton")
-                    and button.Active and t.visible(button) and not (lock and lock.Visible) then
-                    rows[row.Name] = button
+    if not extras.alive or t.busy then return end
+    local ok, err = pcall(function()
+        local modules = ReplicatedStorage:FindFirstChild("TankModules")
+        local source = modules and modules:FindFirstChild("JSONExportHandler")
+        local folder = ReplicatedStorage:FindFirstChild("PlaceableModels")
+        if not source or not folder then error("Tertiary catalog is unavailable.") end
+        local data = require(source).unformatted
+        if type(data) ~= "table" or type(data.WeaponClasses) ~= "table" then error("Unsupported catalog format.") end
+        local catalog, names = {}, {}
+        for _, class in pairs(data.WeaponClasses) do
+            for _, item in pairs(type(class) == "table" and class.Tertiary or {}) do
+                local name = type(item) == "table" and item.NameID
+                local model = type(name) == "string" and folder:FindFirstChild(name)
+                if model and model:IsA("Model") and not catalog[name] then
+                    catalog[name] = model
+                    names[#names + 1] = name
                 end
             end
         end
-    end
-    return rows
+        table.sort(names)
+        t.allowed = catalog
+        if not catalog[t.selected] then t.selected = nil end
+        if t.dropdown then t.dropdown:Refresh(names) end
+        if announce then extras.notify(string.format("%d placeable tertiary templates found. Server eligibility still applies.", #names)) end
+    end)
+    if not ok then extras.notify("Tertiary catalog unavailable: " .. tostring(err)) end
 end
 function extras.tertiary.inventory(name)
     if type(name) ~= "string" then return nil end
     for _, container in pairs({ lp:FindFirstChild("Backpack"), lp.Character }) do
         for _, tool in ipairs(container:GetChildren()) do
             local placeable = tool:FindFirstChild("PlaceableName")
-            if tool:IsA("Tool") and (tool.Name == name or placeable and placeable:IsA("StringValue") and placeable.Value == name) then
-                return tool
-            end
+            if tool:IsA("Tool") and (tool.Name == name or placeable and placeable:IsA("StringValue") and placeable.Value == name) then return tool end
         end
     end
-end
-function extras.tertiary.refresh()
-    local t = extras.tertiary
-    t.allowed = t.rows()
-    local _, weapons = t.context()
-    local frame = weapons and weapons:FindFirstChild("TeritaryFrame")
-    if frame then
-        for _, row in ipairs(frame:GetChildren()) do
-            if row:IsA("ViewportFrame") and t.inventory(row.Name) then t.allowed[row.Name] = true end
-        end
-    end
-    local names = {}
-    for name in pairs(t.allowed) do names[#names + 1] = name end
-    table.sort(names)
-    if not t.allowed[t.selected] then t.selected = nil end
-    if t.dropdown then t.dropdown:Refresh(names) end
-    return names
-end
-function extras.tertiary.nearestLocker()
-    local character = lp.Character
-    local root = character and character:FindFirstChild("HumanoidRootPart")
-    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-    local map = workspace:FindFirstChild("Map")
-    local lockers = map and map:FindFirstChild("WeaponLockers")
-    if not root or not humanoid or humanoid.Health <= 0 or humanoid.SeatPart or not lockers then return nil end
-    local nearest, distance
-    for _, locker in ipairs(lockers:GetChildren()) do
-        if locker:IsA("Model") and (locker.Name == "Teritary" or locker.Name == "Tertiary") then
-            local detector = locker:FindFirstChildOfClass("ClickDetector")
-            if detector then
-                local d = (locker:GetPivot().Position - root.Position).Magnitude
-                if d <= detector.MaxActivationDistance and (not distance or d < distance) then nearest, distance = detector, d end
-            end
-        end
-    end
-    return nearest
-end
-function extras.tertiary.open()
-    local t = extras.tertiary
-    if not extras.alive or t.busy then return end
-    t.busy = true
-    task.spawn(function()
-        local ok, err = pcall(function()
-            if next(t.rows()) == nil then
-                local _, weapons = t.context()
-                if not t.visible(weapons) then
-                    local detector = t.nearestLocker()
-                    if not detector or type(fireclickdetector) ~= "function" then
-                        t.refresh()
-                        extras.notify("Move within a tertiary locker's normal pickup range, on foot, then try again. You can also click the locker directly.")
-                        return
-                    end
-                    fireclickdetector(detector)
-                    local deadline = os.clock() + 3
-                    repeat
-                        task.wait(0.1)
-                        _, weapons = t.context()
-                    until not extras.alive or t.visible(weapons) or os.clock() >= deadline
-                    if not extras.alive then return end
-                end
-                local activated, reason = t.activate(weapons and weapons:FindFirstChild("TeritaryFrame"))
-                if not activated then t.refresh(); extras.notify(reason); return end
-                local deadline = os.clock() + 3
-                repeat task.wait(0.1) until not extras.alive or next(t.rows()) ~= nil or os.clock() >= deadline
-            end
-            if not extras.alive then return end
-            local names = t.refresh()
-            extras.notify(#names > 0 and ("Choose a tertiary item in Lumen; only unlocked game choices are listed.")
-                or "No selectable tertiary items found. Use the normal game menu to check class, points and ownership.")
-        end)
-        t.busy = false
-        if not ok then extras.notify("Tertiary picker unavailable: " .. tostring(err)) end
-    end)
 end
 function extras.tertiary.equip()
     local t = extras.tertiary
@@ -4340,40 +4251,141 @@ function extras.tertiary.equip()
     local tool = t.allowed[t.selected] and t.inventory(t.selected)
     local humanoid = lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
     if not tool or not humanoid or humanoid.Health <= 0 or humanoid.SeatPart then
-        extras.notify("Select an available tertiary already in your inventory; equip it while alive and on foot."); return
+        extras.notify("This action only equips an existing inventory item while alive and on foot."); return
     end
     local ok = pcall(function() humanoid:EquipTool(tool) end)
-    extras.notify(ok and tool.Parent == lp.Character and ("Equipped " .. t.selected)
-        or "The selected tertiary could not be equipped.")
+    extras.notify(ok and tool.Parent == lp.Character and ("Equipped " .. t.selected) or "The selected tertiary could not be equipped.")
+end
+function extras.tertiary.pose(model)
+    local character = lp.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    local cam = workspace.CurrentCamera
+    if not root or not humanoid or humanoid.Health <= 0 or humanoid.SeatPart or not cam then
+        return nil, "Place tertiary equipment while alive and on foot."
+    end
+    local cursor = UserInputService:GetMouseLocation()
+    local ray = cam:ScreenPointToRay(cursor.X, cursor.Y)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { character }
+    local hit = workspace:Raycast(ray.Origin, ray.Direction * 50000, params)
+    if not hit then return nil, "Aim at a nearby surface, not the sky." end
+    local range = 15 * (tonumber(model:GetAttribute("MaxDistanceMultiplier")) or 1)
+    if (hit.Position - root.Position).Magnitude > range then return nil, "Placement target exceeds this item's normal range." end
+    local kind = model:GetAttribute("Type")
+    if kind and kind ~= "All" and hit.Instance.Name ~= kind then return nil, "This tertiary requires a " .. tostring(kind) .. " attachment surface." end
+    if model:GetAttribute("OnlyOnGround") and hit.Normal.Y < 0.7 then return nil, "This tertiary requires a ground surface." end
+    local bounds, size = model:GetBoundingBox()
+    local relative = model:GetPivot():ToObjectSpace(bounds)
+    local bottom = relative.Position.Y - size.Y * 0.5
+    local position = hit.Position + Vector3.yAxis * (-bottom)
+    local look = root.CFrame.LookVector
+    local bearing = Vector3.new(look.X, 0, look.Z)
+    if bearing.Magnitude < 0.001 then bearing = Vector3.new(0, 0, -1) end
+    local frame = CFrame.lookAt(position, position + bearing.Unit)
+    local attached = hit.Instance:IsA("BasePart") and hit.Instance or nil
+    return { frame = frame, attached = attached, relative = attached and attached.CFrame:ToObjectSpace(frame) or nil }
+end
+function extras.tertiary.native()
+    if type(getsenv) ~= "function" then error("Native placement access is unavailable in this executor.") end
+    local gui = lp:FindFirstChild("PlayerGui")
+    gui = gui and gui:FindFirstChild("PlaceableGui")
+    local scriptObject = gui and gui:FindFirstChild("BuildingScript")
+    if not scriptObject then error("The game's placement handler is not loaded.") end
+    local environment = getsenv(scriptObject)
+    if type(environment) ~= "table" then error("Native placement entry point is unavailable.") end
+    return environment
+end
+function extras.tertiary.dispatch(name, pose)
+    local environment = extras.tertiary.native()
+    if type(environment.placePlaceable) ~= "function" then error("Native placement entry point is unavailable.") end
+    -- Let the native handler supply its real build-tool and extra payload. Do
+    -- not invent inventory grants, ownership tags, cooldowns or security data.
+    environment.placePlaceable(name, pose.frame, pose.attached, pose.relative)
+end
+function extras.tertiary.activateOwned()
+    local t = extras.tertiary
+    if not extras.alive or t.busy or os.clock() < (t.activateAt or 0) then return end
+    if Settings.Freecam or Settings.Zoom then extras.notify("Exit freecam and zoom before starting drone control."); return end
+    local name = t.selected
+    local buildings = workspace:FindFirstChild("PlacedBuildings")
+    local owned = false
+    if buildings and name and t.allowed[name] then
+        for _, object in ipairs(buildings:GetChildren()) do
+            local owner = object:FindFirstChild("OwnershipTag")
+            if object.Name == name and owner and owner:IsA("StringValue") and owner.Value == lp.Name
+                and object:FindFirstChild("Activate") then owned = true; break end
+        end
+    end
+    if not owned then extras.notify("No owned, activatable placement of this tertiary was found."); return end
+    t.activateAt = os.clock() + 1
+    local ok, err = pcall(function()
+        local environment = t.native()
+        if type(environment.activatePlaceables) ~= "function" then error("Native activation entry point is unavailable.") end
+        environment.activatePlaceables(name)
+    end)
+    extras.notify(ok and "Activation requested; the game decides whether control starts." or ("Activation unavailable: " .. tostring(err)))
 end
 function extras.tertiary.request()
     local t = extras.tertiary
-    if not extras.alive or t.busy then return end
+    if not extras.alive or t.busy or os.clock() < (t.nextAt or 0) then return end
     local name = t.selected
-    local button = name and t.rows()[name]
-    if not button then extras.notify("Open/refresh the normal tertiary picker and choose an unlocked item first."); return end
+    local model = name and t.allowed[name]
+    if not model or not model.Parent then extras.notify("Refresh the tertiary catalog and select an item first."); return end
     t.busy = true
+    t.nextAt = os.clock() + 1
     task.spawn(function()
+        local connection
         local ok, err = pcall(function()
-            -- Recheck the live row after scheduling, rather than trust cached options.
-            button = t.rows()[name]
-            if not button then extras.notify("That choice is no longer available; refresh the picker."); return end
-            local activated, reason = t.activate(button)
-            if not activated then extras.notify(reason); return end
-            task.wait(0.1)
             if not extras.alive then return end
-            local _, weapons = t.context()
-            local frame = weapons and weapons:FindFirstChild("TeritaryFrame")
-            local selected = frame and frame:FindFirstChild(name)
-            if not selected or not selected:IsA("ViewportFrame") then extras.notify("The game did not confirm this tertiary selection."); return end
-            activated, reason = t.activate(weapons:FindFirstChild("WeaponFrameButton"))
-            if not activated then extras.notify("Tertiary selected. " .. reason); return end
-            extras.notify("Requested loadout with " .. name .. "; the server decides whether to grant it.")
+            if t.allowed[name] ~= model or not model.Parent then error("Selected template changed; refresh the catalog.") end
+            local pose, reason = t.pose(model)
+            if not pose then extras.notify(reason); return end
+            local buildings = workspace:FindFirstChild("PlacedBuildings")
+            if not buildings then error("Placed-buildings container is unavailable.") end
+            local candidates = {}
+            connection = buildings.ChildAdded:Connect(function(object)
+                if object.Name == name and object:IsA("Model") then candidates[#candidates + 1] = object end
+            end)
+            t.pendingConnection = connection
+            t.dispatch(name, pose)
+            extras.notify("Placement requested: " .. name .. ". Waiting for an owned object; not an inventory grant.")
+            local deadline = os.clock() + 4
+            while extras.alive and os.clock() < deadline do
+                for _, object in ipairs(candidates) do
+                    local owner = object.Parent == buildings and object:FindFirstChild("OwnershipTag")
+                    if owner and owner:IsA("StringValue") and owner.Value == lp.Name
+                        and (object:GetPivot().Position - pose.frame.Position).Magnitude <= 12 then
+                        extras.notify("Placement observed: " .. name)
+                        return
+                    end
+                end
+                task.wait(0.1)
+            end
+            if extras.alive then extras.notify("No owned placement confirmed. The server may have rejected eligibility, surface, range or cooldown.") end
         end)
+        if connection then connection:Disconnect() end
+        t.pendingConnection = nil
         t.busy = false
-        if not ok then extras.notify("Tertiary request unavailable: " .. tostring(err)) end
+        if not ok then extras.notify("Tertiary placement unavailable: " .. tostring(err)) end
     end)
 end
+function extras.tertiary.input(input, processed)
+    local t = extras.tertiary
+    if processed or not extras.alive or not Settings.TertiaryPlacementBind
+        or UserInputService:GetFocusedTextBox() or t.window and t.window.IsOpen then return end
+    local key = Settings.TertiaryPlacementKey
+    if key and (input.KeyCode == key or input.UserInputType == key) then t.request() end
+end
+function extras.tertiary.destroy()
+    local t = extras.tertiary
+    if t.inputConnection then t.inputConnection:Disconnect() end
+    if t.pendingConnection then t.pendingConnection:Disconnect() end
+    t.dropdown, t.window = nil, nil
+    table.clear(t.allowed)
+end
+extras.tertiary.inputConnection = UserInputService.InputBegan:Connect(extras.tertiary.input)
 
 -- Quick placement affects only the equipped tertiary's local placement preview.
 -- Never invoke placement remotes, mutate placed buildings, or shorten destruction.
@@ -5192,6 +5204,7 @@ end)
 _G.AutoLeadAssistUnload = function()
     extras.alive = false
     extras.tick:Disconnect()
+    extras.tertiary.destroy()
     extras.quickPlace.destroy()
     for _, conn in pairs(extras.foliage.roots) do conn:Disconnect() end
     extras.foliage.restore()
