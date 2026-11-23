@@ -599,6 +599,16 @@ end
 -- AutoLeadOverlay. A failed library fetch does not disable aiming or visuals.
 local vibeUi = nil
 local extras = { alive = true, edits = {}, roleCache = {}, pending = {}, notified = {} }
+extras.ammo = { restored = 0, skipped = 0, backend = "legacy", supported = true }
+do
+    local vehicles = ReplicatedStorage:FindFirstChild("Vehicles")
+    local ammo = vehicles and vehicles:FindFirstChild("Ammo")
+    if ammo and ammo:FindFirstChild("AmmoClient") and ammo:FindFirstChild("AmmoState") then
+        extras.ammo.backend = "AmmoState"
+        extras.ammo.supported = false
+        extras.ammo.reason = "Infinite Ammo unavailable: this build uses synchronized AmmoState ammunition. Legacy counter restoration cannot refill it."
+    end
+end
 extras.tertiary = { selected = nil, allowed = {}, busy = false }
 function extras.notify(message)
     if not extras.alive then return end
@@ -662,8 +672,18 @@ do
 
             local aimTab = window:Tab({ Name = "Aim", Columns = 2 })
             local aimAssist = aimTab:Section({ Name = "Assist", Side = 1 })
-            settingToggle(aimAssist, "Infinite Ammo / No Reload", "InfiniteAmmo",
-                "Opt-in local reload suppression. Server ammo rules still apply; off by default.")
+            aimAssist:Toggle({
+                Name = extras.ammo.supported and "Infinite Ammo / No Reload" or "Infinite Ammo (Unavailable)",
+                Flag = "ALA_InfiniteAmmo",
+                Default = Settings.InfiniteAmmo,
+                Info = extras.ammo.reason or "Legacy local ammo/reload suppression; off by default.",
+                Callback = function(value)
+                    Settings.InfiniteAmmo = value == true
+                    if Settings.InfiniteAmmo and not extras.ammo.supported then
+                        extras.notify(extras.ammo.reason)
+                    end
+                end
+            })
             settingToggle(aimAssist, "Enable Assist", "EnableAutoLead", "Master aiming and preview switch.")
             settingToggle(aimAssist, "Adaptive Aim", "AdaptiveAim",
                 "Low arc first. Use a high lob only when the low trajectory fails clearance or gun limits. Never force high arcs.")
@@ -4744,9 +4764,9 @@ end
 
 -- Native gunner controllers debit their own counters AFTER fireWeapon returns.
 -- Capture the caller's actual state, never a fixed upvalue index or a GC scan.
-local ammoReconcile = { restored = 0, skipped = 0 }
+local ammoReconcile = extras.ammo
 function ammoReconcile.capture(caller, weapon, vehicle)
-    if not Settings.InfiniteAmmo or not debug.getupvalues or not caller then return end
+    if not Settings.InfiniteAmmo or not ammoReconcile.supported or not debug.getupvalues or not caller then return end
     local values = debug.getupvalues(caller)
     local counters, owner
     for _, value in pairs(values) do
@@ -4846,7 +4866,7 @@ local function installHooks()
             oldFireWeapon = wh.fireWeapon
             hookedWeaponHandler = wh
 
-            wh.fireWeapon = function(p56, p57, u58, p59, p60, p61, p62, p63)
+            wh.fireWeapon = function(p56, p57, u58, p59, p60, p61, p62, p63, ...)
                 if isAdaptiveAimActive()
                     and aimCache.vehicle == p59 and aimCache.weapon and aimCache.weapon.weapon == u58
                     and (aimCache.waitForAlignment or aimCache.solutionBlocked) then
@@ -4867,13 +4887,15 @@ local function installHooks()
                 -- Off preserves the native caller's reload flag, including nil.
                 -- Do not use 'enabled and false or p60': false would fall through.
                 local reloadAfterShot = p60
-                if Settings.InfiniteAmmo then reloadAfterShot = false end
+                if Settings.InfiniteAmmo and ammoReconcile.supported then reloadAfterShot = false end
                 local ammoSnapshot
-                if Settings.InfiniteAmmo and debug.info then
+                if Settings.InfiniteAmmo and ammoReconcile.supported and debug.info then
                     local ok, snapshot = pcall(ammoReconcile.capture, debug.info(2, "f"), u58, p59)
                     if ok then ammoSnapshot = snapshot else ammoReconcile.error = tostring(snapshot) end
                 end
-                local call = table.pack(pcall(oldFireWeapon, p56, p57, u58, p59, reloadAfterShot, p61, p62, p63))
+                -- Current callers also pass a rocket, ammo index and timestamp.
+                -- Preserve every trailing argument, including nil entries.
+                local call = table.pack(pcall(oldFireWeapon, p56, p57, u58, p59, reloadAfterShot, p61, p62, p63, ...))
                 if held then
                     heldFire.busy = false
                     if shotTracker.serial > before then
@@ -5010,7 +5032,9 @@ _G.AutoLeadAssistDiagnostics = function()
         groupChecks = { groupId = 32966202, error = extras.roleError,
             staffEnabled = Settings.StaffNotifications, creatorEnabled = Settings.CreatorNotifications },
         ammoReconcile = { restored = ammoReconcile.restored, skipped = ammoReconcile.skipped,
-            error = ammoReconcile.error },
+            backend = ammoReconcile.backend, supported = ammoReconcile.supported,
+            active = Settings.InfiniteAmmo and ammoReconcile.supported,
+            reason = ammoReconcile.reason, error = ammoReconcile.error },
         weaponHook = hookedWeaponHandler ~= nil,
         directFireReady = veh and shotCodeByVehicle[veh] ~= nil or false,
         directFireError = lastDirectFireError,
