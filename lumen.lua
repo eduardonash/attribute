@@ -119,6 +119,7 @@ local Settings = {
         or Color3.fromRGB(255, 209, 90),
     ArtilleryAutoLay = rememberedSettings.ArtilleryAutoLay ~= false,
     InfiniteAmmo = rememberedSettings.InfiniteAmmo == true,
+    QuickLoader = rememberedSettings.QuickLoader == true,
     TurretSpeedEnabled = rememberedSettings.TurretSpeedEnabled == true,
     TurretSpeedMultiplier = math.clamp(tonumber(rememberedSettings.TurretSpeedMultiplier) or 1, 0.25, 3),
     TankRapidFire = rememberedSettings.TankRapidFire == true,
@@ -966,6 +967,8 @@ do
                     if extras.quickPlace then extras.quickPlace.update() end
                 end })
             local tuning = vehicleTab:Section({ Name = "Turret & Firing", Side = 2 })
+            settingToggle(tuning, "Quick Loader", "QuickLoader",
+                "Automatically attempt the native loader timing window once per reload. Requires an available loader minigame; normal ammo consumption applies.")
             settingToggle(tuning, "Turret Rotate Speed", "TurretSpeedEnabled", "Local occupied-turret speed override; restores on exit or disable.")
             tuning:Slider({ Name = "Turret Rotate Speed Slider", Min = 0.25, Max = 3,
                 Default = Settings.TurretSpeedMultiplier, Decimals = 2, Suffix = "x",
@@ -4630,6 +4633,88 @@ function extras.foliage.update()
         end
     end
 end
+extras.quickLoader = { frames = {}, attempts = 0, status = "disabled" }
+function extras.quickLoader.clear()
+    local loader = extras.quickLoader
+    for _, name in ipairs({ "added", "removed", "tick" }) do
+        if loader[name] then loader[name]:Disconnect(); loader[name] = nil end
+    end
+    table.clear(loader.frames)
+    loader.bar = nil
+end
+function extras.quickLoader.add(frame)
+    if not frame:IsA("GuiObject") then return end
+    local progress = frame:FindFirstChild("Progress")
+    local window = frame:FindFirstChild("FastReloadWindow")
+    local button = frame:FindFirstChild("ControlsButton")
+    if progress and progress:IsA("GuiObject") and window and window:IsA("GuiObject")
+        and button and button:IsA("GuiButton") then
+        extras.quickLoader.frames[frame] = { progress = progress, window = window, button = button }
+    end
+end
+function extras.quickLoader.frame()
+    local loader = extras.quickLoader
+    if not extras.alive or not Settings.QuickLoader then return end
+    if not loader.bar or not loader.bar.Parent or not loader.bar.Visible then return end
+    local gui = loader.bar.Parent
+    if gui:IsA("ScreenGui") and not gui.Enabled then return end
+    local character = lp.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    if not humanoid or humanoid.Health <= 0 or not humanoid.SeatPart
+        or character:GetAttribute("Knocked") then return end
+    for frame, entry in pairs(loader.frames) do
+        if frame.Parent ~= loader.bar then
+            loader.frames[frame] = nil
+        elseif not entry.attempted and frame.Visible and not frame:GetAttribute("ReloadComplete")
+            and entry.progress.Parent == frame and entry.window.Parent == frame and entry.button.Parent == frame
+            and entry.window.Visible and entry.button.Visible then
+            local progress = entry.progress.Size.X.Scale
+            local center = entry.window.Position.X.Scale
+            local halfWidth = entry.window.Size.X.Scale / 2
+            -- Match the strict timing test in the native quickReload callback.
+            if progress < 1 and halfWidth > 0 and math.abs(progress - center) < halfWidth then
+                entry.attempted = true
+                loader.attempts += 1
+                local ok, err = pcall(firesignal, entry.button.Activated)
+                loader.status = ok and "native action invoked" or "activation failed"
+                loader.error = not ok and tostring(err) or nil
+            end
+        end
+    end
+end
+function extras.quickLoader.update()
+    local loader = extras.quickLoader
+    if not extras.alive or not Settings.QuickLoader then
+        loader.clear()
+        loader.status = "disabled"
+        return
+    end
+    if type(firesignal) ~= "function" then
+        loader.clear()
+        loader.status = "native button activation unavailable"
+        return
+    end
+    local gui = lp.PlayerGui:FindFirstChild("CrewGui")
+    local bar = gui and gui:FindFirstChild("loadBar")
+    if loader.bar == bar and bar then return end
+    loader.clear()
+    if not bar then loader.status = "waiting for loader UI"; return end
+    loader.bar = bar
+    loader.status = "waiting for timing window"
+    loader.added = bar.ChildAdded:Connect(loader.add)
+    loader.removed = bar.ChildRemoved:Connect(function(frame) loader.frames[frame] = nil end)
+    for _, frame in ipairs(bar:GetChildren()) do loader.add(frame) end
+    -- Cached frame references keep the narrow timing check free of tree scans.
+    loader.tick = RunService.Heartbeat:Connect(function()
+        local ok, err = pcall(loader.frame)
+        if not ok then
+            loader.clear()
+            loader.status, loader.error = "activation failed", tostring(err)
+            -- Stop retries until the user toggles the feature or reloads.
+            Settings.QuickLoader = false
+        end
+    end)
+end
 function extras.flushShots()
     if not Settings.ShotStatus then extras.shotCount = 0; return end
     if (extras.shotCount or 0) == 0 or os.clock() < (extras.nextShotToast or 0) then return end
@@ -4641,6 +4726,12 @@ end
 extras.tick = RunService.Heartbeat:Connect(function()
     if not extras.alive or os.clock() < (extras.nextTick or 0) then return end
     extras.nextTick = os.clock() + 0.25
+    local loaderOK, loaderError = pcall(extras.quickLoader.update)
+    if not loaderOK then
+        extras.quickLoader.clear()
+        extras.quickLoader.status = "unavailable"
+        extras.quickLoader.error = tostring(loaderError)
+    end
     local placementOK, placementError = pcall(extras.quickPlace.update)
     if not placementOK then
         extras.quickPlace.clear()
@@ -5027,6 +5118,8 @@ _G.AutoLeadAssistDiagnostics = function()
             focusScans = shellRedirection.focusScans, focusRays = shellRedirection.focusRays,
             visualWrites = shellRedirection.visualWrites, frameMs = shellRedirection.frameMs },
         infiniteAmmo = Settings.InfiniteAmmo,
+        quickLoader = { enabled = Settings.QuickLoader, status = extras.quickLoader.status,
+            attempts = extras.quickLoader.attempts, error = extras.quickLoader.error },
         vehicleExtras = { localEdits = #extras.edits, error = extras.tuningError,
             turretSpeedEnabled = Settings.TurretSpeedEnabled, rapidFireEnabled = Settings.TankRapidFire },
         groupChecks = { groupId = 32966202, error = extras.roleError,
@@ -5228,6 +5321,7 @@ end)
 _G.AutoLeadAssistUnload = function()
     extras.alive = false
     extras.tick:Disconnect()
+    extras.quickLoader.clear()
     extras.tertiary.destroy()
     extras.quickPlace.destroy()
     for _, conn in pairs(extras.foliage.roots) do conn:Disconnect() end
